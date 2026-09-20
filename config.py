@@ -35,3 +35,6 @@ REPORT_TXT_PATH = DATA_DIR / "scrape_report.txt"
 
 LOG_FILE_PATH = LOGS_DIR / "scraper.log"
 FAILED_PRODUCTS_PATH = LOGS_DIR / "failed_products.csv"
+
+# Custom scrape output CSV path
+CUSTOM_CSV_PATH = DATA_DIR / "custom_site_products.csv"
