@@ -53,8 +53,8 @@ website-data-scraper/
 
 1. **Clone the Repository**:
    ```bash
-   git clone https://github.com/<your-username>/tehzeeb-libas-scraper.git
-   cd tehzeeb-libas-scraper
+   git clone https://github.com/a4rehman/website-data-scraper.git
+   cd website-data-scraper
    ```
 
 2. **Create and Activate Virtual Environment**:
