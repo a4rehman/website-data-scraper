@@ -1,6 +1,6 @@
-# Tehzeeb Libas E-Commerce Product Scraper & Streamlit Dashboard
+# Website Data Scraper & Streamlit Dashboard
 
-A production-ready Python web scraper and interactive Streamlit web application for extracting, cleaning, and exporting the complete public product catalog from [Tehzeeb Libas](https://tehzeeblibas.com/).
+A production-ready Python web scraper and interactive Streamlit web application for extracting, cleaning, and exporting public product catalogs into CSV format.
 
 ---
 
@@ -19,7 +19,7 @@ A production-ready Python web scraper and interactive Streamlit web application 
 ## Repository Structure
 
 ```
-tehzeeb-libas-scraper/
+website-data-scraper/
 ├── scraper/
 │   ├── __init__.py
 │   ├── discovery.py         # Catalog Discovery & Category Filtering
@@ -125,17 +125,17 @@ python -m pytest tests/
 
 | Field | Description | Example |
 |---|---|---|
-| `product_id` | Unique Shopify product ID | `8114111348811` |
+| `product_id` | Unique product ID | `8114111348811` |
 | `sku` | Primary SKU code | `PAK-ME2-S-4` |
 | `product_name` | Product Title | `MAHAM EMBROIDERED 2PC` |
 | `description` | Cleaned plain text description | `This exquisite Women's Farshi Shalwar Kurta...` |
-| `brand` | Vendor / Brand | `Tehzeeb Libas` |
+| `brand` | Vendor / Brand | `Brand Name` |
 | `category` | Product Type | `Daily/Basic Wear` |
 | `subcategory` | Piece classification | `2 Piece` |
 | `collection` | Associated collections | `Everyday Essentials` |
 | `product_type` | Website Product Type | `Daily/Basic Wear` |
-| `product_url` | Full product page URL | `https://tehzeeblibas.com/products/maham-embroidered-2pc` |
-| `image_url` | High-res primary image link | `https://cdn.shopify.com/.../IMG_5504.jpg` |
+| `product_url` | Full product page URL | `https://example.com/products/maham-embroidered-2pc` |
+| `image_url` | High-res primary image link | `https://cdn.example.com/.../IMG_5504.jpg` |
 | `additional_image_urls` | Pipe-separated secondary images | `img2.jpg\|img3.jpg\|img4.jpg` |
 | `price` | Active price (numeric PKR) | `3980` |
 | `sale_price` | Sale price if on discount | `3980` |
@@ -156,5 +156,5 @@ python -m pytest tests/
 
 1. Push your repository to GitHub.
 2. Sign in to [Streamlit Community Cloud](https://streamlit.io/cloud).
-3. Click **New App**, select your repository `tehzeeb-libas-scraper`, and set Main file path to `streamlit_app.py`.
+3. Click **New App**, select your repository, and set Main file path to `streamlit_app.py`.
 4. Click **Deploy!**
