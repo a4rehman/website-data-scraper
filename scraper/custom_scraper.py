@@ -18,6 +18,7 @@ def _extract_minimal_from_html(html: str, base_url: str) -> List[Dict[str, Any]]
     price = price_tag["content"] if price_tag and price_tag.get("content") else None
     if title:
         products.append({
+            "product_id": "",
             "product_name": title.strip(),
             "price": price,
             "product_url": base_url,
@@ -30,6 +31,7 @@ def _extract_minimal_from_html(html: str, base_url: str) -> List[Dict[str, Any]]
             "product_type": "",
             "brand": "",
             "availability": "",
+            "stock_status": "",
             "sizes": "",
             "colors": "",
             "variants": "",
@@ -52,34 +54,58 @@ def scrape_custom_site(url: str) -> List[Dict[str, Any]]:
     base = url.rstrip('/')
     json_url = f"{base}/products.json"
     logger.info(f"Attempting to fetch JSON product feed from {json_url}")
-    data = fetch_json(json_url)
+
+    # Paginate through all pages of products.json
+    all_raw_products: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        data = fetch_json(json_url, params={"page": page, "limit": 250})
+        if data and isinstance(data, dict) and data.get("products"):
+            batch = data["products"]
+            all_raw_products.extend(batch)
+            logger.info(f"Page {page}: fetched {len(batch)} products (total: {len(all_raw_products)})")
+            if len(batch) < 250:
+                break
+            page += 1
+        else:
+            break
+
     products: List[Dict[str, Any]] = []
-    if data and isinstance(data, dict) and data.get("products"):
-        logger.info(f"Found {len(data['products'])} products via JSON endpoint")
-        for raw in data["products"]:
+    if all_raw_products:
+        logger.info(f"Found {len(all_raw_products)} total products via JSON endpoint")
+        for raw in all_raw_products:
+            # image field can be a dict with "src" or a direct URL string
+            raw_image = raw.get("image") or {}
+            image_url = raw_image.get("src", "") if isinstance(raw_image, dict) else str(raw_image)
+            # Extract additional image URLs
+            raw_images = raw.get("images") or []
+            additional_urls = [img.get("src", "") if isinstance(img, dict) else str(img) for img in raw_images]
+            first_variant = raw.get("variants", [{}])[0] if raw.get("variants") else {}
             products.append({
+                "product_id": str(raw.get("id", "")),
                 "product_name": raw.get("title", ""),
-                "sku": raw.get("variants", [{}])[0].get("sku", ""),
-                "price": raw.get("variants", [{}])[0].get("price", ""),
-                "sale_price": raw.get("variants", [{}])[0].get("compare_at_price", ""),
+                "sku": first_variant.get("sku", ""),
+                "price": first_variant.get("price", ""),
+                "sale_price": first_variant.get("compare_at_price", "") or "",
                 "product_url": f"{base}/products/{raw.get('handle', '')}",
-                "image_url": raw.get("image", ""),
+                "image_url": image_url,
                 "description": raw.get("body_html", ""),
                 "category": "",
                 "subcategory": "",
                 "collection": "",
                 "product_type": raw.get("product_type", ""),
                 "brand": raw.get("vendor", ""),
-                "availability": "In Stock" if raw.get("available", True) else "Out of Stock",
+                "availability": "In Stock" if first_variant.get("available", True) else "Out of Stock",
+                "stock_status": "In Stock" if first_variant.get("available", True) else "Out of Stock",
                 "sizes": "",
                 "colors": "",
                 "variants": json.dumps(raw.get("variants", [])),
                 "material": "",
                 "tags": raw.get("tags", ""),
-                "currency": raw.get("variants", [{}])[0].get("currency", ""),
-                "original_price": raw.get("variants", [{}])[0].get("compare_at_price", ""),
+                "currency": first_variant.get("currency", ""),
+                "original_price": first_variant.get("compare_at_price", "") or "",
                 "discount_percentage": "",
-                "additional_image_urls": json.dumps(raw.get("images", []))
+                "additional_image_urls": ", ".join(additional_urls),
             })
     else:
         logger.warning("JSON endpoint not available or empty, falling back to HTML parsing")
