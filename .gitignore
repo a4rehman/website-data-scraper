@@ -1,0 +1,32 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Python Cache & Build
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Generated Data & Log Files (Keep empty directories via .gitkeep)
+data/products_raw.csv
+data/products_clean.csv
+data/tehzeeb_libas_products.csv
+data/progress.json
+data/scrape_report.txt
+logs/scraper.log
+logs/failed_products.csv
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
