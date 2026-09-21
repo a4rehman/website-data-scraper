@@ -170,24 +170,38 @@ with col_btn2:
 refresh_btn = st.sidebar.button("🔄 Refresh Status", use_container_width=True)
 
 # --- CUSTOM SITE SCRAPER ---
-custom_url = st.sidebar.text_input("Custom Site URL", placeholder="https://example.com")
-scrape_custom_btn = st.sidebar.button("🕸️ Scrape Custom Site")
+st.sidebar.markdown("---")
+st.sidebar.header("🕸️ Custom Site Scraper")
+custom_url = st.sidebar.text_input("Website URL", placeholder="https://example.com")
+scrape_custom_btn = st.sidebar.button("🕸️ Scrape Custom Site", use_container_width=True)
 if scrape_custom_btn:
     if custom_url:
-        with st.spinner("Scraping custom site..."):
+        status_container = st.empty()
+        status_container.info("🔍 Analyzing site — trying multiple extraction strategies (Shopify JSON → JSON-LD → Browser Rendering → HTML fallback)...")
+        try:
             from scraper.custom_scraper import scrape_custom_site
             custom_products = scrape_custom_site(custom_url)
             if custom_products:
                 export_to_csv(custom_products, config.CUSTOM_CSV_PATH)
-                st.success(f"Scraped {len(custom_products)} items. CSV saved.")
+                status_container.success(f"✅ Scraped **{len(custom_products)}** products from {custom_url}")
                 st.download_button(
-                    "Download Custom CSV",
+                    "📥 Download Custom Site CSV",
                     data=config.CUSTOM_CSV_PATH.read_bytes(),
                     file_name="custom_site_products.csv",
-                    mime="text/csv"
+                    mime="text/csv",
+                    use_container_width=True,
                 )
+                # Show preview
+                custom_df = pd.read_csv(config.CUSTOM_CSV_PATH, encoding="utf-8-sig")
+                preview_cols = [c for c in ["product_name", "price", "image_url", "product_url"] if c in custom_df.columns]
+                if preview_cols:
+                    st.dataframe(custom_df[preview_cols].head(20), use_container_width=True, hide_index=True)
+            else:
+                status_container.error("❌ Could not extract products. The site may require login, use CAPTCHAs, or block automated access.")
+        except Exception as e:
+            status_container.error(f"❌ Scraping failed: {e}")
     else:
-        st.warning("Please enter a URL.")
+        st.sidebar.warning("Please enter a URL.")
 
 if start_btn:
     if not st.session_state.scraping_in_progress:
