@@ -17,6 +17,8 @@ __pycache__/
 .pytest_cache/
 
 # Generated Data & Log Files (Keep empty directories via .gitkeep)
+data/products.csv
+data/products.json
 data/products_raw.csv
 data/products_clean.csv
 data/tehzeeb_libas_products.csv
@@ -24,6 +26,9 @@ data/progress.json
 data/scrape_report.txt
 logs/scraper.log
 logs/failed_products.csv
+
+# Scratch / Temporary scripts
+scratch/
 
 # IDE / OS
 .vscode/

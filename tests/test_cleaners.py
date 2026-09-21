@@ -40,10 +40,11 @@ def test_process_images():
         {"src": "https://cdn.shopify.com/img1.jpg?v=123"},  # Duplicate
         {"src": "https://cdn.shopify.com/img2.jpg"}
     ]
-    main_img, additional_imgs = process_images(images)
+    main_img, additional_imgs, all_imgs = process_images(images)
     assert "img1.jpg" in main_img
     assert "img2.jpg" in additional_imgs
     assert "|" not in main_img
+    assert "img1.jpg" in all_imgs and "img2.jpg" in all_imgs
 
 def test_extract_material_and_pieces():
     text = "Beautiful 3-piece suit made from premium Lawn and Chiffon dupatta"

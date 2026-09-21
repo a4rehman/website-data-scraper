@@ -26,7 +26,55 @@ USER_AGENT = os.getenv(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
+# Universal Schema Columns for CSV Export
+UNIVERSAL_CSV_COLUMNS = [
+    "source_domain",
+    "source_url",
+    "product_id",
+    "sku",
+    "product_name",
+    "title",
+    "description",
+    "short_description",
+    "brand",
+    "vendor",
+    "seller",
+    "category",
+    "subcategory",
+    "collection",
+    "product_type",
+    "tags",
+    "product_url",
+    "price",
+    "sale_price",
+    "original_price",
+    "list_price",
+    "discount_percentage",
+    "currency",
+    "availability",
+    "stock_status",
+    "colors",
+    "sizes",
+    "material",
+    "fabric",
+    "pattern",
+    "variants",
+    "variant_count",
+    "main_image",
+    "additional_images",
+    "all_images",
+    "video_url",
+    "specifications",
+    "rating",
+    "review_count",
+    "sold_count",
+    "shipping_information",
+    "scraped_at",
+]
+
 # Output Paths
+UNIVERSAL_CSV_PATH = DATA_DIR / "products.csv"
+UNIVERSAL_JSON_PATH = DATA_DIR / "products.json"
 RAW_CSV_PATH = DATA_DIR / "products_raw.csv"
 CLEAN_CSV_PATH = DATA_DIR / "products_clean.csv"
 FINAL_CSV_PATH = DATA_DIR / "tehzeeb_libas_products.csv"

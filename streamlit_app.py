@@ -4,29 +4,65 @@ import json
 import time
 import threading
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Optional, Dict, Any, List
 
 import config
-from scraper.discovery import CatalogDiscovery
-from scraper.product_scraper import ProductScraper
-from scraper.cleaners import deduplicate_products
+from scraper.engine import UniversalScrapingEngine
 from scraper.exporter import (
     export_to_csv,
-    export_raw_to_csv,
+    export_to_json,
     load_progress,
     save_progress,
     generate_quality_report
 )
+from scraper.utils import logger
 
-# Page Configuration
+# Set page layout and config
 st.set_page_config(
-    page_title="Tehzeeb Libas Product Scraper",
+    page_title="Universal E-Commerce Product Extractor",
     page_icon="🛍️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Global background worker state using st.session_state
+# Custom Styling
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.2rem;
+        font-weight: 700;
+        background: linear-gradient(90deg, #4f46e5, #06b6d4);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.2rem;
+    }
+    .sub-header {
+        font-size: 1.05rem;
+        color: #6b7280;
+        margin-bottom: 1.5rem;
+    }
+    .analysis-card {
+        background-color: rgba(79, 70, 229, 0.06);
+        border: 1px solid rgba(79, 70, 229, 0.25);
+        border-radius: 10px;
+        padding: 1.2rem;
+        margin-top: 1rem;
+        margin-bottom: 1.5rem;
+    }
+    .metric-badge {
+        display: inline-block;
+        padding: 0.25rem 0.6rem;
+        border-radius: 6px;
+        font-size: 0.85rem;
+        font-weight: 600;
+    }
+    .badge-success { background: #dcfce7; color: #166534; }
+    .badge-warning { background: #fef3c7; color: #92400e; }
+    .badge-info { background: #e0e7ff; color: #3730a3; }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize Session State
 if "scraping_in_progress" not in st.session_state:
     st.session_state.scraping_in_progress = False
 if "current_status" not in st.session_state:
@@ -39,181 +75,179 @@ if "total_target" not in st.session_state:
     st.session_state.total_target = 0
 if "stop_requested" not in st.session_state:
     st.session_state.stop_requested = False
+if "url_analysis" not in st.session_state:
+    st.session_state.url_analysis = None
+if "last_scrape_results" not in st.session_state:
+    st.session_state.last_scrape_results = None
 
-# Lock for background worker
-if "worker_lock" not in st.session_state:
-    st.session_state.worker_lock = threading.Lock()
+stop_event = threading.Event()
 
-def run_scraper_task(mode: str, category: Optional[str] = None):
-    """
-    Background worker thread running the scraper engine safely.
-    """
+# Title Header
+st.markdown('<div class="main-header">Universal E-Commerce Product Scraper</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Extract structured product catalogs, variants, pricing, and images from any e-commerce website URL</div>', unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Sidebar Controls
+# ---------------------------------------------------------------------------
+st.sidebar.header("⚙️ Extraction Settings")
+
+max_products_val = st.sidebar.number_input(
+    "Max Products to Extract",
+    min_value=1,
+    max_value=1000,
+    value=20,
+    step=5,
+    help="Limit the total number of products to discover and scrape"
+)
+
+request_delay_val = st.sidebar.slider(
+    "Request Delay (seconds)",
+    min_value=0.2,
+    max_value=5.0,
+    value=float(config.REQUEST_DELAY),
+    step=0.2,
+    help="Polite rate limiting delay between consecutive requests"
+)
+
+use_browser_val = st.sidebar.toggle(
+    "Use Headless Browser (Playwright)",
+    value=True,
+    help="Required for dynamic JavaScript SPAs (e.g. Temu, Shein, React/Vue storefronts)"
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Fields & Feature Toggles")
+extract_images_val = st.sidebar.checkbox("Extract High-Res Images", value=True)
+extract_variants_val = st.sidebar.checkbox("Extract Variant Matrix (Size/Color)", value=True)
+extract_descriptions_val = st.sidebar.checkbox("Extract Full Descriptions", value=True)
+resume_val = st.sidebar.checkbox("Resume Previous Scrape State", value=False)
+
+st.sidebar.markdown("---")
+
+# Quick Sample Links
+st.sidebar.subheader("💡 Example URLs")
+if st.sidebar.button("👗 Temu Listing Sample", use_container_width=True):
+    st.session_state.preset_url = "https://www.temu.com/pk-en/womens-clothing-o3-28.html"
+if st.sidebar.button("🛍️ Tehzeeb Libas Catalog", use_container_width=True):
+    st.session_state.preset_url = "https://tehzeeblibas.com/collections/all"
+if st.sidebar.button("📦 WooCommerce Store Sample", use_container_width=True):
+    st.session_state.preset_url = "https://woocommerce.com/products/"
+
+# ---------------------------------------------------------------------------
+# Main URL Input & Analysis Section
+# ---------------------------------------------------------------------------
+default_url = st.session_state.get("preset_url", "")
+url_input = st.text_input(
+    "Paste Product / Category / Collection / Search URL:",
+    value=default_url,
+    placeholder="e.g. https://www.temu.com/pk-en/womens-clothing-o3-28.html or https://example.com/products/item-1"
+)
+
+col_act1, col_act2, col_act3 = st.columns([2, 2, 3])
+
+with col_act1:
+    analyze_btn = st.button("🔍 Analyze URL", use_container_width=True, disabled=st.session_state.scraping_in_progress)
+
+with col_act2:
+    start_btn = st.button("🚀 Start Extraction", use_container_width=True, disabled=st.session_state.scraping_in_progress or not url_input)
+
+with col_act3:
+    stop_btn = st.button("⏸ Stop / Cancel", use_container_width=True, disabled=not st.session_state.scraping_in_progress)
+
+# URL Analysis Execution
+if analyze_btn:
+    if url_input:
+        with st.spinner("Analyzing target URL and detecting platform architecture..."):
+            engine = UniversalScrapingEngine()
+            analysis = engine.analyze_url(url_input)
+            st.session_state.url_analysis = analysis
+    else:
+        st.warning("Please enter a valid URL to analyze.")
+
+# Display Analysis Card if available
+if st.session_state.url_analysis:
+    an = st.session_state.url_analysis
+    st.markdown(f"""
+    <div class="analysis-card">
+        <h4 style="margin-top:0; color:#4f46e5;">🌐 Website Analysis Result</h4>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; font-size: 0.95rem;">
+            <div><strong>Target Domain:</strong><br/><code>{an.get('domain', 'N/A')}</code></div>
+            <div><strong>Detected Platform:</strong><br/><span class="metric-badge badge-info">{an.get('platform', 'N/A')}</span></div>
+            <div><strong>Detected Page Type:</strong><br/><span class="metric-badge badge-success">{an.get('page_type', 'N/A')}</span></div>
+            <div><strong>Extraction Engine:</strong><br/><code>{an.get('adapter_name', 'Generic')}</code></div>
+        </div>
+        <div style="margin-top: 10px; font-size: 0.9rem; color: #4b5563;">
+            <strong>Strategy:</strong> {an.get('extraction_method', 'Standard Multi-Strategy')} &nbsp;|&nbsp; 
+            <strong>Browser JS Rendering:</strong> {'⚡ Required' if an.get('requires_js') else '✅ Not strictly required'}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Background Scraping Task Runner
+# ---------------------------------------------------------------------------
+def run_scrape_worker(target_url, max_p, delay, browser, imgs, vars_flag, descs, resume_flag):
+    engine = UniversalScrapingEngine()
+
+    def update_progress(data: Dict[str, Any]):
+        st.session_state.current_status = data.get("status", "")
+        st.session_state.progress_count = data.get("progress_count", 0)
+        st.session_state.total_target = data.get("total_target", 0)
+        st.session_state.current_product = data.get("current_product", "")
+
     st.session_state.scraping_in_progress = True
-    st.session_state.stop_requested = False
-    st.session_state.current_status = "Discovering products..."
-    st.session_state.progress_count = 0
+    st.session_state.current_status = "Starting extraction..."
+    stop_event.clear()
 
     try:
-        discovery = CatalogDiscovery()
-        raw_products = discovery.discover_all_products(category_filter=category if mode == "Category / Collection" else None)
-        total_discovered = len(raw_products)
-
-        if not raw_products:
-            st.session_state.current_status = "Error: No products discovered."
-            st.session_state.scraping_in_progress = False
-            return
-
-        if mode == "Test (10 Products)":
-            raw_products = raw_products[:10]
-
-        st.session_state.total_target = len(raw_products)
-        st.session_state.current_status = f"Scraping catalog ({len(raw_products)} items)..."
-
-        scraped_products: List[Dict[str, Any]] = []
-        scraped_ids = set()
-        failed_count = 0
-
-        if mode == "Resume Previous Scrape":
-            progress_data = load_progress()
-            scraped_products = progress_data.get("scraped_products", [])
-            scraped_ids = set(progress_data.get("scraped_ids", []))
-            failed_count = progress_data.get("failed_count", 0)
-
-        scraper = ProductScraper(collections_map=discovery.collections_map)
-        raw_saved_list = []
-
-        for idx, raw_p in enumerate(raw_products, start=1):
-            if st.session_state.stop_requested:
-                st.session_state.current_status = "Scrape stopped by user."
-                break
-
-            p_id = str(raw_p.get("id"))
-            p_title = raw_p.get("title", "Unknown Product")
-
-            st.session_state.current_product = p_title
-            st.session_state.progress_count = idx
-
-            if p_id in scraped_ids:
-                continue
-
-            parsed_p, error = scraper.process_raw_product(raw_p)
-            if parsed_p:
-                scraped_products.append(parsed_p)
-                scraped_ids.add(p_id)
-                raw_saved_list.append(raw_p)
-            else:
-                failed_count += 1
-
-            if idx % 5 == 0 or idx == len(raw_products):
-                save_progress(list(scraped_ids), scraped_products, failed_count)
-
-        # Deduplicate & Export
-        clean_products, duplicates_removed = deduplicate_products(scraped_products)
-
-        missing_price = sum(1 for p in clean_products if not p.get("price"))
-        missing_image = sum(1 for p in clean_products if not p.get("image_url"))
-        missing_category = sum(1 for p in clean_products if not p.get("category"))
-        missing_sku = sum(1 for p in clean_products if not p.get("sku"))
-
-        export_to_csv(clean_products, config.FINAL_CSV_PATH)
-        export_to_csv(clean_products, config.CLEAN_CSV_PATH)
-        export_raw_to_csv(raw_saved_list, config.RAW_CSV_PATH)
-
-        stats = {
-            "discovered": total_discovered,
-            "scraped": len(clean_products),
-            "failed": failed_count,
-            "duplicates_removed": duplicates_removed,
-            "missing_price": missing_price,
-            "missing_image": missing_image,
-            "missing_category": missing_category,
-            "missing_sku": missing_sku
-        }
-        generate_quality_report(stats, config.REPORT_TXT_PATH)
-
-        if not st.session_state.stop_requested:
-            st.session_state.current_status = "Completed Successfully!"
-
+        results = engine.scrape_url(
+            url=target_url,
+            max_products=max_p,
+            request_delay=delay,
+            use_browser=browser,
+            extract_images=imgs,
+            extract_variants=vars_flag,
+            extract_descriptions=descs,
+            resume=resume_flag,
+            progress_callback=update_progress,
+            stop_event=stop_event
+        )
+        st.session_state.last_scrape_results = results
+        st.session_state.current_status = f"✅ Completed! Extracted {len(results.get('products', []))} products."
     except Exception as e:
-        st.session_state.current_status = f"Error: {str(e)}"
+        logger.error(f"Scraping thread error: {e}")
+        st.session_state.current_status = f"❌ Error: {e}"
     finally:
         st.session_state.scraping_in_progress = False
 
-# --- HEADER SECTION ---
-st.title("🛍️ Tehzeeb Libas Product Scraper")
-st.markdown("### E-Commerce Product Data Extraction & CSV Export Dashboard")
-
-st.markdown("---")
-
-# --- SIDEBAR CONTROLS ---
-st.sidebar.header("⚙️ Scraper Controls")
-
-mode = st.sidebar.selectbox(
-    "Scraping Mode",
-    ["Test (10 Products)", "Full Catalog", "Resume Previous Scrape", "Category / Collection"]
-)
-
-category_input = None
-if mode == "Category / Collection":
-    category_input = st.sidebar.text_input("Category / Collection Name", placeholder="e.g. Everyday Essentials")
-
-st.sidebar.markdown("---")
-
-col_btn1, col_btn2 = st.sidebar.columns(2)
-
-with col_btn1:
-    start_btn = st.button("🚀 Start Scraping", disabled=st.session_state.scraping_in_progress, use_container_width=True)
-
-with col_btn2:
-    stop_btn = st.button("⏸ Stop / Cancel", disabled=not st.session_state.scraping_in_progress, use_container_width=True)
-
-refresh_btn = st.sidebar.button("🔄 Refresh Status", use_container_width=True)
-
-# --- CUSTOM SITE SCRAPER ---
-st.sidebar.markdown("---")
-st.sidebar.header("🕸️ Custom Site Scraper")
-custom_url = st.sidebar.text_input("Website URL", placeholder="https://example.com")
-scrape_custom_btn = st.sidebar.button("🕸️ Scrape Custom Site", use_container_width=True)
-if scrape_custom_btn:
-    if custom_url:
-        status_container = st.empty()
-        status_container.info("🔍 Analyzing site — trying multiple extraction strategies (Shopify JSON → JSON-LD → Browser Rendering → HTML fallback)...")
-        try:
-            from scraper.custom_scraper import scrape_custom_site
-            custom_products = scrape_custom_site(custom_url)
-            if custom_products:
-                export_to_csv(custom_products, config.CUSTOM_CSV_PATH)
-                status_container.success(f"✅ Scraped **{len(custom_products)}** products from {custom_url}")
-                st.download_button(
-                    "📥 Download Custom Site CSV",
-                    data=config.CUSTOM_CSV_PATH.read_bytes(),
-                    file_name="custom_site_products.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-                # Show preview
-                custom_df = pd.read_csv(config.CUSTOM_CSV_PATH, encoding="utf-8-sig")
-                preview_cols = [c for c in ["product_name", "price", "image_url", "product_url"] if c in custom_df.columns]
-                if preview_cols:
-                    st.dataframe(custom_df[preview_cols].head(20), use_container_width=True, hide_index=True)
-            else:
-                status_container.error("❌ Could not extract products. The site may require login, use CAPTCHAs, or block automated access.")
-        except Exception as e:
-            status_container.error(f"❌ Scraping failed: {e}")
-    else:
-        st.sidebar.warning("Please enter a URL.")
-
 if start_btn:
-    if not st.session_state.scraping_in_progress:
-        worker_thread = threading.Thread(target=run_scraper_task, args=(mode, category_input), daemon=True)
+    if url_input and not st.session_state.scraping_in_progress:
+        worker_thread = threading.Thread(
+            target=run_scrape_worker,
+            args=(
+                url_input,
+                max_products_val,
+                request_delay_val,
+                use_browser_val,
+                extract_images_val,
+                extract_variants_val,
+                extract_descriptions_val,
+                resume_val,
+            ),
+            daemon=True
+        )
         worker_thread.start()
         st.rerun()
 
 if stop_btn:
+    stop_event.set()
     st.session_state.stop_requested = True
-    st.sidebar.warning("Stop requested...")
+    st.warning("Stop requested. Halting scraper gracefully...")
 
-# --- METRICS & STATUS ---
+# ---------------------------------------------------------------------------
+# Live Status & Metrics Section
+# ---------------------------------------------------------------------------
+st.markdown("---")
 st.subheader("📊 Live Status & Metrics")
 
 status_col1, status_col2 = st.columns([3, 1])
@@ -225,22 +259,22 @@ with status_col2:
     else:
         st.success("✅ System ready")
 
-# Live Progress Bar
 if st.session_state.scraping_in_progress or st.session_state.progress_count > 0:
     total = st.session_state.total_target if st.session_state.total_target > 0 else 1
     pct = min(st.session_state.progress_count / total, 1.0)
     st.progress(pct)
-    st.caption(f"Current Item: **{st.session_state.current_product}** | Progress: **{st.session_state.progress_count} / {st.session_state.total_target}** ({int(pct*100)}%)")
+    st.caption(f"Current Item: **{st.session_state.current_product}** | Processed: **{st.session_state.progress_count} / {st.session_state.total_target}** ({int(pct*100)}%)")
 
-# Calculate metrics from final CSV or report if available
+# Calculate metrics from final files if present
 discovered_val = 0
 scraped_val = 0
 failed_val = 0
 dupes_val = 0
 missing_price_val = 0
 missing_img_val = 0
-missing_cat_val = 0
+missing_desc_val = 0
 missing_sku_val = 0
+has_vars_val = 0
 
 if config.REPORT_TXT_PATH.exists():
     try:
@@ -248,9 +282,9 @@ if config.REPORT_TXT_PATH.exists():
         for line in report_text.splitlines():
             if "Total Products Discovered:" in line:
                 discovered_val = int(line.split(":")[-1].strip())
-            elif "Total Products Scraped:" in line:
+            elif "Total Products Extracted:" in line or "Total Products Scraped:" in line:
                 scraped_val = int(line.split(":")[-1].strip())
-            elif "Total Failed Products:" in line:
+            elif "Total Failed" in line:
                 failed_val = int(line.split(":")[-1].strip())
             elif "Duplicates Removed:" in line:
                 dupes_val = int(line.split(":")[-1].strip())
@@ -258,95 +292,142 @@ if config.REPORT_TXT_PATH.exists():
                 missing_price_val = int(line.split(":")[-1].strip())
             elif "Products Missing Image:" in line:
                 missing_img_val = int(line.split(":")[-1].strip())
-            elif "Products Missing Category:" in line:
-                missing_cat_val = int(line.split(":")[-1].strip())
+            elif "Products Missing Description:" in line:
+                missing_desc_val = int(line.split(":")[-1].strip())
             elif "Products Missing SKU:" in line:
                 missing_sku_val = int(line.split(":")[-1].strip())
+            elif "Products With Variants:" in line:
+                has_vars_val = int(line.split(":")[-1].strip())
     except Exception:
         pass
 
-m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+m_col1, m_col2, m_col3, m_col4, m_col5, m_col6 = st.columns(6)
 m_col1.metric("Discovered", discovered_val)
-m_col2.metric("Scraped", scraped_val)
+m_col2.metric("Extracted", scraped_val)
 m_col3.metric("Failed", failed_val)
-m_col4.metric("Duplicates Removed", dupes_val)
+m_col4.metric("Duplicates", dupes_val)
+m_col5.metric("With Variants", has_vars_val)
+m_col6.metric("Missing Price", missing_price_val)
 
-m_col5, m_col6, m_col7, m_col8 = st.columns(4)
-m_col5.metric("Missing Price", missing_price_val)
-m_col6.metric("Missing Image", missing_img_val)
-m_col7.metric("Missing Category", missing_cat_val)
-m_col8.metric("Missing SKU", missing_sku_val)
-
+# ---------------------------------------------------------------------------
+# Data Preview & Downloads Tabs
+# ---------------------------------------------------------------------------
 st.markdown("---")
+st.subheader("📦 Results & Dataset Preview")
 
-# --- RESULTS DATA TABLE ---
-st.subheader("📋 Scraped Products Data")
+tab_preview, tab_json, tab_report, tab_logs = st.tabs([
+    "📊 Product Table Preview",
+    "🔍 Structured JSON View",
+    "📄 Data Quality Report",
+    "📜 Live Scraper Logs"
+])
 
-if config.FINAL_CSV_PATH.exists():
-    try:
-        df = pd.read_csv(config.FINAL_CSV_PATH, encoding="utf-8-sig")
-        st.dataframe(
-            df[[
-                "product_name", "sku", "category", "price", "sale_price", 
-                "availability", "sizes", "colors", "product_url", "image_url"
-            ]],
-            column_config={
-                "image_url": st.column_config.ImageColumn("Image", help="Product thumbnail preview"),
-                "product_url": st.column_config.LinkColumn("Product Link")
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-    except Exception as e:
-        st.warning(f"Could not load products table: {e}")
-else:
-    st.info("No scraped dataset found on disk yet. Click '🚀 Start Scraping' to extract catalog products.")
+with tab_preview:
+    # Check UNIVERSAL_CSV_PATH or FINAL_CSV_PATH
+    active_csv = config.UNIVERSAL_CSV_PATH if config.UNIVERSAL_CSV_PATH.exists() else config.FINAL_CSV_PATH
+    if active_csv.exists() and active_csv.stat().st_size > 50:
+        try:
+            df = pd.read_csv(active_csv, encoding="utf-8-sig")
+            st.write(f"Displaying **{len(df)}** extracted products:")
+            
+            # Select key columns for concise preview
+            preview_cols = [
+                c for c in [
+                    "product_name", "price", "sale_price", "original_price", "currency",
+                    "brand", "category", "availability", "variant_count", "main_image", "product_url"
+                ] if c in df.columns
+            ]
+            st.dataframe(
+                df[preview_cols] if preview_cols else df,
+                use_container_width=True,
+                hide_index=True
+            )
+        except Exception as e:
+            st.error(f"Could not load preview table: {e}")
+    else:
+        st.info("No scraped dataset available yet. Paste a URL and click 'Start Extraction' above.")
 
+with tab_json:
+    if config.UNIVERSAL_JSON_PATH.exists() and config.UNIVERSAL_JSON_PATH.stat().st_size > 10:
+        try:
+            with open(config.UNIVERSAL_JSON_PATH, "r", encoding="utf-8") as jf:
+                raw_json = json.load(jf)
+                st.write(f"Structured JSON tree ({len(raw_json)} items):")
+                st.json(raw_json[:5] if len(raw_json) > 5 else raw_json)
+        except Exception as e:
+            st.error(f"Could not parse JSON dataset: {e}")
+    else:
+        st.info("No JSON dataset generated yet.")
+
+with tab_report:
+    if config.REPORT_TXT_PATH.exists():
+        st.code(config.REPORT_TXT_PATH.read_text(encoding="utf-8"), language="text")
+    else:
+        st.info("No quality report available yet.")
+
+with tab_logs:
+    if config.LOG_FILE_PATH.exists():
+        try:
+            log_lines = config.LOG_FILE_PATH.read_text(encoding="utf-8").splitlines()
+            st.code("\n".join(log_lines[-40:]), language="text")
+        except Exception:
+            st.info("Logs empty.")
+    else:
+        st.info("No logs generated yet.")
+
+# ---------------------------------------------------------------------------
+# Download Center
+# ---------------------------------------------------------------------------
 st.markdown("---")
+st.subheader("📥 Export Center")
 
-# --- DOWNLOADS & LOGS ---
-d_col1, d_col2 = st.columns(2)
+d_col1, d_col2, d_col3, d_col4 = st.columns(4)
 
 with d_col1:
-    st.subheader("📥 Export & Downloads")
-    if config.FINAL_CSV_PATH.exists():
-        csv_bytes = config.FINAL_CSV_PATH.read_bytes()
+    csv_file = config.UNIVERSAL_CSV_PATH if config.UNIVERSAL_CSV_PATH.exists() else config.FINAL_CSV_PATH
+    if csv_file.exists() and csv_file.stat().st_size > 10:
         st.download_button(
-            label="📥 Download Final CSV (tehzeeb_libas_products.csv)",
-            data=csv_bytes,
-            file_name="tehzeeb_libas_products.csv",
+            label="📥 Download CSV Dataset",
+            data=csv_file.read_bytes(),
+            file_name="products.csv",
             mime="text/csv",
             use_container_width=True
         )
+    else:
+        st.button("📥 Download CSV", disabled=True, use_container_width=True)
 
-    if config.REPORT_TXT_PATH.exists():
-        report_bytes = config.REPORT_TXT_PATH.read_bytes()
+with d_col2:
+    if config.UNIVERSAL_JSON_PATH.exists() and config.UNIVERSAL_JSON_PATH.stat().st_size > 10:
         st.download_button(
-            label="📊 Download Scrape Report (scrape_report.txt)",
-            data=report_bytes,
+            label="📥 Download JSON Dataset",
+            data=config.UNIVERSAL_JSON_PATH.read_bytes(),
+            file_name="products.json",
+            mime="application/json",
+            use_container_width=True
+        )
+    else:
+        st.button("📥 Download JSON", disabled=True, use_container_width=True)
+
+with d_col3:
+    if config.REPORT_TXT_PATH.exists():
+        st.download_button(
+            label="📄 Download Scrape Report",
+            data=config.REPORT_TXT_PATH.read_bytes(),
             file_name="scrape_report.txt",
             mime="text/plain",
             use_container_width=True
         )
+    else:
+        st.button("📄 Download Report", disabled=True, use_container_width=True)
 
-    if config.FAILED_PRODUCTS_PATH.exists() and config.FAILED_PRODUCTS_PATH.stat().st_size > 50:
-        failed_bytes = config.FAILED_PRODUCTS_PATH.read_bytes()
+with d_col4:
+    if config.LOG_FILE_PATH.exists():
         st.download_button(
-            label="⚠️ Download Failed Products (failed_products.csv)",
-            data=failed_bytes,
-            file_name="failed_products.csv",
-            mime="text/csv",
+            label="📜 Download Log File",
+            data=config.LOG_FILE_PATH.read_bytes(),
+            file_name="scraper.log",
+            mime="text/plain",
             use_container_width=True
         )
-
-with d_col2:
-    st.subheader("📜 Scraper Logs")
-    with st.expander("Show Recent Activity Logs", expanded=True):
-        if config.LOG_FILE_PATH.exists():
-            try:
-                log_lines = config.LOG_FILE_PATH.read_text(encoding="utf-8").splitlines()[-30:]
-                st.code("\n".join(log_lines), language="log")
-            except Exception as e:
-                st.write(f"Could not read log file: {e}")
-        else:
-            st.info("No log file found yet.")
+    else:
+        st.button("📜 Download Logs", disabled=True, use_container_width=True)

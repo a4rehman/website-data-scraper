@@ -34,7 +34,7 @@ def parse_product_data(raw_product: Dict[str, Any], collections_map: Optional[Di
 
     # Images
     images = raw_product.get("images", [])
-    image_url, additional_image_urls = process_images(images)
+    image_url, additional_image_urls, all_images = process_images(images)
 
     # Variants, Sizes, Colors, Pricing, Stock
     variants_raw = raw_product.get("variants", [])
