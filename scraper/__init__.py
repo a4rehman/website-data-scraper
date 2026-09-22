@@ -17,7 +17,8 @@ from scraper.exporter import (
     save_progress,
     generate_quality_report,
 )
-from scraper.utils import logger, fetch_html, fetch_json
+from scraper.utils import logger, fetch_html, fetch_json, validate_safe_url
+from scraper.ai_processor import summarize_scraped_data_with_ai, parse_ai_json_response
 import scraper.adapters as adapters
 
 __all__ = [
@@ -39,5 +40,8 @@ __all__ = [
     "logger",
     "fetch_html",
     "fetch_json",
+    "validate_safe_url",
+    "summarize_scraped_data_with_ai",
+    "parse_ai_json_response",
     "adapters",
 ]

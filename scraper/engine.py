@@ -13,7 +13,7 @@ from scraper.exporter import (
     save_progress,
     generate_quality_report
 )
-from scraper.utils import fetch_html, logger
+from scraper.utils import fetch_html, logger, validate_safe_url
 
 class UniversalScrapingEngine:
     """
@@ -27,14 +27,27 @@ class UniversalScrapingEngine:
     def analyze_url(self, url: str) -> Dict[str, Any]:
         """
         Analyzes the target URL to detect platform, page type, and extraction strategy.
+        Validates URL security (SSRF prevention) before attempting fetch.
         """
-        url = url.strip()
-        if not url:
-            return {"error": "Empty URL provided."}
+        if not url or not isinstance(url, str):
+            return {"error": "Please enter a valid URL."}
 
-        parsed = urlparse(url)
-        if not parsed.scheme:
+        url = url.strip()
+        parsed_raw = urlparse(url)
+        if not parsed_raw.scheme:
             url = f"https://{url}"
+
+        is_safe, reason = validate_safe_url(url)
+        if not is_safe:
+            parsed = urlparse(url)
+            return {
+                "error": reason,
+                "domain": parsed.netloc or "Blocked Domain",
+                "platform": "Blocked / Untrusted URL",
+                "page_type": "Security Restriction",
+                "requires_js": False,
+                "extraction_method": "Blocked by Security Policy (SSRF Prevention)"
+            }
 
         # Fetch lightweight HTML to assist platform fingerprinting if not obvious
         html = None
@@ -69,9 +82,30 @@ class UniversalScrapingEngine:
         Executes full extraction pipeline on a target URL with live progress tracking and exports.
         """
         start_time = time.time()
+        if not url or not isinstance(url, str):
+            return {
+                "success": False,
+                "message": "Invalid or empty URL provided.",
+                "analysis": {"error": "Empty URL"},
+                "stats": {"discovered": 0, "scraped": 0, "failed": 0, "duplicates_removed": 0},
+                "products": [],
+            }
+
         url = url.strip()
-        if not url.startswith("http://") and not url.startswith("https://"):
+        parsed_raw = urlparse(url)
+        if not parsed_raw.scheme:
             url = f"https://{url}"
+
+        is_safe, reason = validate_safe_url(url)
+        if not is_safe:
+            logger.warning(f"Engine blocked unsafe URL: {url} ({reason})")
+            return {
+                "success": False,
+                "message": f"Access Blocked: {reason}",
+                "analysis": {"error": reason, "domain": "Blocked"},
+                "stats": {"discovered": 0, "scraped": 0, "failed": 0, "duplicates_removed": 0},
+                "products": [],
+            }
 
         target_csv = csv_path or config.UNIVERSAL_CSV_PATH
         target_json = json_path or config.UNIVERSAL_JSON_PATH
@@ -106,7 +140,7 @@ class UniversalScrapingEngine:
         if not discovered_raw:
             return {
                 "success": False,
-                "message": "No products could be discovered at this URL.",
+                "message": "Unable to discover products at this URL. The site may require dynamic JavaScript rendering or block automated access.",
                 "analysis": analysis,
                 "stats": {"discovered": 0, "scraped": 0, "failed": 0, "duplicates_removed": 0},
                 "products": [],

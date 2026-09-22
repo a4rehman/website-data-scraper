@@ -15,7 +15,8 @@ from scraper.exporter import (
     save_progress,
     generate_quality_report
 )
-from scraper.utils import logger
+from scraper.ai_processor import summarize_scraped_data_with_ai
+from scraper.utils import logger, validate_safe_url
 
 # Set page layout and config
 st.set_page_config(
@@ -59,10 +60,11 @@ st.markdown("""
     .badge-success { background: #dcfce7; color: #166534; }
     .badge-warning { background: #fef3c7; color: #92400e; }
     .badge-info { background: #e0e7ff; color: #3730a3; }
+    .badge-danger { background: #fee2e2; color: #991b1b; }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize Session State
+# Initialize Session State (Phase 10)
 if "scraping_in_progress" not in st.session_state:
     st.session_state.scraping_in_progress = False
 if "current_status" not in st.session_state:
@@ -77,8 +79,12 @@ if "stop_requested" not in st.session_state:
     st.session_state.stop_requested = False
 if "url_analysis" not in st.session_state:
     st.session_state.url_analysis = None
+if "last_url" not in st.session_state:
+    st.session_state.last_url = ""
 if "last_scrape_results" not in st.session_state:
     st.session_state.last_scrape_results = None
+if "ai_summary_result" not in st.session_state:
+    st.session_state.ai_summary_result = None
 
 stop_event = threading.Event()
 
@@ -123,6 +129,11 @@ extract_descriptions_val = st.sidebar.checkbox("Extract Full Descriptions", valu
 resume_val = st.sidebar.checkbox("Resume Previous Scrape State", value=False)
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("🤖 AI Processing (OpenRouter / OpenAI)")
+ai_api_key = st.sidebar.text_input("API Key (Optional)", type="password", help="Optional API Key for AI catalog summarization")
+ai_model_name = st.sidebar.selectbox("AI Model", ["openai/gpt-3.5-turbo", "anthropic/claude-3-haiku", "google/gemini-flash-1.5"], index=0)
+
+st.sidebar.markdown("---")
 
 # Quick Sample Links
 st.sidebar.subheader("💡 Example URLs")
@@ -143,45 +154,62 @@ url_input = st.text_input(
     placeholder="e.g. https://www.temu.com/pk-en/womens-clothing-o3-28.html or https://example.com/products/item-1"
 )
 
+# Detect URL change and clear old state if needed (Phase 10)
+if url_input != st.session_state.last_url:
+    st.session_state.last_url = url_input
+    st.session_state.url_analysis = None
+    st.session_state.ai_summary_result = None
+
 col_act1, col_act2, col_act3 = st.columns([2, 2, 3])
 
 with col_act1:
     analyze_btn = st.button("🔍 Analyze URL", use_container_width=True, disabled=st.session_state.scraping_in_progress)
 
 with col_act2:
-    start_btn = st.button("🚀 Start Extraction", use_container_width=True, disabled=st.session_state.scraping_in_progress or not url_input)
+    start_btn = st.button("🚀 Start Extraction", use_container_width=True, disabled=st.session_state.scraping_in_progress or not url_input.strip())
 
 with col_act3:
     stop_btn = st.button("⏸ Stop / Cancel", use_container_width=True, disabled=not st.session_state.scraping_in_progress)
 
-# URL Analysis Execution
+# URL Analysis Execution (Phase 2, 5, 12)
 if analyze_btn:
-    if url_input:
-        with st.spinner("Analyzing target URL and detecting platform architecture..."):
-            engine = UniversalScrapingEngine()
-            analysis = engine.analyze_url(url_input)
-            st.session_state.url_analysis = analysis
+    cleaned_url = url_input.strip()
+    if not cleaned_url:
+        st.warning("Please enter a target URL to analyze.")
     else:
-        st.warning("Please enter a valid URL to analyze.")
+        is_safe, reason = validate_safe_url(cleaned_url)
+        if not is_safe:
+            st.error(f"⚠️ Security / URL Error: {reason}")
+        else:
+            with st.spinner("Analyzing target URL and detecting platform architecture..."):
+                try:
+                    engine = UniversalScrapingEngine()
+                    analysis = engine.analyze_url(cleaned_url)
+                    st.session_state.url_analysis = analysis
+                except Exception as e:
+                    st.error(f"Unable to analyze URL: {e}")
 
 # Display Analysis Card if available
 if st.session_state.url_analysis:
     an = st.session_state.url_analysis
-    st.markdown(f"""
-    <div class="analysis-card">
-        <h4 style="margin-top:0; color:#4f46e5;">🌐 Website Analysis Result</h4>
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; font-size: 0.95rem;">
-            <div><strong>Target Domain:</strong><br/><code>{an.get('domain', 'N/A')}</code></div>
-            <div><strong>Detected Platform:</strong><br/><span class="metric-badge badge-info">{an.get('platform', 'N/A')}</span></div>
-            <div><strong>Detected Page Type:</strong><br/><span class="metric-badge badge-success">{an.get('page_type', 'N/A')}</span></div>
-            <div><strong>Extraction Engine:</strong><br/><code>{an.get('adapter_name', 'Generic')}</code></div>
+    if "error" in an:
+        st.error(f"URL Analysis Warning: {an['error']}")
+    else:
+        st.markdown(f"""
+        <div class="analysis-card">
+            <h4 style="margin-top:0; color:#4f46e5;">🌐 Website Analysis Result</h4>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; font-size: 0.95rem;">
+                <div><strong>Target Domain:</strong><br/><code>{an.get('domain', 'N/A')}</code></div>
+                <div><strong>Detected Platform:</strong><br/><span class="metric-badge badge-info">{an.get('platform', 'N/A')}</span></div>
+                <div><strong>Detected Page Type:</strong><br/><span class="metric-badge badge-success">{an.get('page_type', 'N/A')}</span></div>
+                <div><strong>Extraction Engine:</strong><br/><code>{an.get('adapter_name', 'Generic')}</code></div>
+            </div>
+            <div style="margin-top: 10px; font-size: 0.9rem; color: #4b5563;">
+                <strong>Strategy:</strong> {an.get('extraction_method', 'Standard Multi-Strategy')} &nbsp;|&nbsp; 
+                <strong>Browser JS Rendering:</strong> {'⚡ Required' if an.get('requires_js') else '✅ Not strictly required'}
+            </div>
         </div>
-        <div style="margin-top: 10px; font-size: 0.9rem; color: #4b5563;">
-            <strong>Strategy:</strong> {an.get('extraction_method', 'Standard Multi-Strategy')} &nbsp;|&nbsp; 
-            <strong>Browser JS Rendering:</strong> {'⚡ Required' if an.get('requires_js') else '✅ Not strictly required'}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Background Scraping Task Runner
@@ -213,7 +241,10 @@ def run_scrape_worker(target_url, max_p, delay, browser, imgs, vars_flag, descs,
             stop_event=stop_event
         )
         st.session_state.last_scrape_results = results
-        st.session_state.current_status = f"✅ Completed! Extracted {len(results.get('products', []))} products."
+        if results.get("success"):
+            st.session_state.current_status = f"✅ Completed! Extracted {len(results.get('products', []))} products."
+        else:
+            st.session_state.current_status = f"⚠️ {results.get('message', 'Extraction ended.')}"
     except Exception as e:
         logger.error(f"Scraping thread error: {e}")
         st.session_state.current_status = f"❌ Error: {e}"
@@ -221,23 +252,32 @@ def run_scrape_worker(target_url, max_p, delay, browser, imgs, vars_flag, descs,
         st.session_state.scraping_in_progress = False
 
 if start_btn:
-    if url_input and not st.session_state.scraping_in_progress:
-        worker_thread = threading.Thread(
-            target=run_scrape_worker,
-            args=(
-                url_input,
-                max_products_val,
-                request_delay_val,
-                use_browser_val,
-                extract_images_val,
-                extract_variants_val,
-                extract_descriptions_val,
-                resume_val,
-            ),
-            daemon=True
-        )
-        worker_thread.start()
-        st.rerun()
+    cleaned_url = url_input.strip()
+    if cleaned_url and not st.session_state.scraping_in_progress:
+        is_safe, reason = validate_safe_url(cleaned_url)
+        if not is_safe:
+            st.error(f"⚠️ Access Blocked: {reason}")
+        else:
+            st.session_state.progress_count = 0
+            st.session_state.total_target = 0
+            st.session_state.ai_summary_result = None
+
+            worker_thread = threading.Thread(
+                target=run_scrape_worker,
+                args=(
+                    cleaned_url,
+                    max_products_val,
+                    request_delay_val,
+                    use_browser_val,
+                    extract_images_val,
+                    extract_variants_val,
+                    extract_descriptions_val,
+                    resume_val,
+                ),
+                daemon=True
+            )
+            worker_thread.start()
+            st.rerun()
 
 if stop_btn:
     stop_event.set()
@@ -252,7 +292,13 @@ st.subheader("📊 Live Status & Metrics")
 
 status_col1, status_col2 = st.columns([3, 1])
 with status_col1:
-    st.info(f"**Current Status:** {st.session_state.current_status}")
+    if "❌" in st.session_state.current_status:
+        st.error(f"**Status:** {st.session_state.current_status}")
+    elif "⚠️" in st.session_state.current_status:
+        st.warning(f"**Status:** {st.session_state.current_status}")
+    else:
+        st.info(f"**Status:** {st.session_state.current_status}")
+
 with status_col2:
     if st.session_state.scraping_in_progress:
         st.warning("⚡ Scraping active...")
@@ -272,9 +318,6 @@ failed_val = 0
 dupes_val = 0
 missing_price_val = 0
 missing_img_val = 0
-missing_desc_val = 0
-missing_sku_val = 0
-has_vars_val = 0
 
 if config.REPORT_TXT_PATH.exists():
     try:
@@ -292,12 +335,6 @@ if config.REPORT_TXT_PATH.exists():
                 missing_price_val = int(line.split(":")[-1].strip())
             elif "Products Missing Image:" in line:
                 missing_img_val = int(line.split(":")[-1].strip())
-            elif "Products Missing Description:" in line:
-                missing_desc_val = int(line.split(":")[-1].strip())
-            elif "Products Missing SKU:" in line:
-                missing_sku_val = int(line.split(":")[-1].strip())
-            elif "Products With Variants:" in line:
-                has_vars_val = int(line.split(":")[-1].strip())
     except Exception:
         pass
 
@@ -306,7 +343,7 @@ m_col1.metric("Discovered", discovered_val)
 m_col2.metric("Extracted", scraped_val)
 m_col3.metric("Failed", failed_val)
 m_col4.metric("Duplicates", dupes_val)
-m_col5.metric("With Variants", has_vars_val)
+m_col5.metric("Missing Img", missing_img_val)
 m_col6.metric("Missing Price", missing_price_val)
 
 # ---------------------------------------------------------------------------
@@ -315,22 +352,21 @@ m_col6.metric("Missing Price", missing_price_val)
 st.markdown("---")
 st.subheader("📦 Results & Dataset Preview")
 
-tab_preview, tab_json, tab_report, tab_logs = st.tabs([
+tab_preview, tab_json, tab_ai, tab_report, tab_logs = st.tabs([
     "📊 Product Table Preview",
     "🔍 Structured JSON View",
+    "🤖 AI Insights & Summary",
     "📄 Data Quality Report",
     "📜 Live Scraper Logs"
 ])
 
 with tab_preview:
-    # Check UNIVERSAL_CSV_PATH or FINAL_CSV_PATH
     active_csv = config.UNIVERSAL_CSV_PATH if config.UNIVERSAL_CSV_PATH.exists() else config.FINAL_CSV_PATH
     if active_csv.exists() and active_csv.stat().st_size > 50:
         try:
             df = pd.read_csv(active_csv, encoding="utf-8-sig")
             st.write(f"Displaying **{len(df)}** extracted products:")
             
-            # Select key columns for concise preview
             preview_cols = [
                 c for c in [
                     "product_name", "price", "sale_price", "original_price", "currency",
@@ -359,6 +395,38 @@ with tab_json:
     else:
         st.info("No JSON dataset generated yet.")
 
+with tab_ai:
+    st.write("### 🤖 AI Catalog Insights")
+    if st.button("✨ Generate AI Catalog Analysis", key="btn_ai_gen"):
+        if config.UNIVERSAL_JSON_PATH.exists() and config.UNIVERSAL_JSON_PATH.stat().st_size > 10:
+            with st.spinner("Analyzing catalog text with AI..."):
+                try:
+                    with open(config.UNIVERSAL_JSON_PATH, "r", encoding="utf-8") as jf:
+                        products_data = json.load(jf)
+                    summary_text = "\n".join([
+                        f"Title: {p.get('product_name')} | Price: {p.get('price')} {p.get('currency')} | Category: {p.get('category')} | Brand: {p.get('brand')}"
+                        for p in products_data[:20]
+                    ])
+                    ai_res = summarize_scraped_data_with_ai(summary_text, api_key=ai_api_key, model=ai_model_name)
+                    st.session_state.ai_summary_result = ai_res
+                except Exception as e:
+                    st.error(f"AI summarization failed: {e}")
+        else:
+            st.warning("No scraped data available to analyze yet. Please run an extraction first.")
+
+    if st.session_state.ai_summary_result:
+        res = st.session_state.ai_summary_result
+        if res.get("success"):
+            data = res.get("data", {})
+            st.success(f"**{data.get('title')}** ({data.get('business_type')})")
+            st.write(f"**Summary:** {data.get('summary')}")
+            if data.get("key_highlights"):
+                st.write("**Key Highlights:**")
+                for h in data["key_highlights"]:
+                    st.markdown(f"- {h}")
+        else:
+            st.error(f"AI Analysis Notice: {res.get('error')}")
+
 with tab_report:
     if config.REPORT_TXT_PATH.exists():
         st.code(config.REPORT_TXT_PATH.read_text(encoding="utf-8"), language="text")
@@ -376,7 +444,7 @@ with tab_logs:
         st.info("No logs generated yet.")
 
 # ---------------------------------------------------------------------------
-# Download Center
+# Download Center (Phase 11)
 # ---------------------------------------------------------------------------
 st.markdown("---")
 st.subheader("📥 Export Center")

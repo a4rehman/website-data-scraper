@@ -32,12 +32,13 @@ CURRENCY_SYMBOLS = {
 def clean_html_description(html_content: str) -> str:
     """
     Converts HTML description string to clean readable plain text.
-    Preserves meaningful formatting, bullet points, specifications separated by ' | '.
+    Decomposes noise elements (script, style, nav, footer, etc.) while preserving
+    meaningful article, main, section, paragraph, and list content separated by ' | '.
     """
     if not html_content:
         return ""
     
-    # Replace breaks and list items with delimiter
+    # Pre-process linebreaks and list items
     html_str = re.sub(r'<br\s*/?>', '\n', str(html_content), flags=re.IGNORECASE)
     html_str = re.sub(r'</p>', '\n', html_str, flags=re.IGNORECASE)
     html_str = re.sub(r'</li>', ' | ', html_str, flags=re.IGNORECASE)
@@ -45,6 +46,11 @@ def clean_html_description(html_content: str) -> str:
     html_str = re.sub(r'</tr>', ' | ', html_str, flags=re.IGNORECASE)
 
     soup = BeautifulSoup(html_str, 'html.parser')
+    
+    # Remove non-content / noise elements
+    for tag in soup(["script", "style", "noscript", "nav", "footer", "aside", "form", "svg", "iframe"]):
+        tag.decompose()
+
     text = soup.get_text()
 
     # Clean multiple blank lines and carriage returns
