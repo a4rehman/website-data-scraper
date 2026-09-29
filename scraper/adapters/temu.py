@@ -1,7 +1,5 @@
 import json
 import re
-import subprocess
-import sys
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, urljoin, parse_qs
 from bs4 import BeautifulSoup
@@ -15,6 +13,7 @@ from scraper.cleaners import (
     clean_html_description
 )
 from scraper.utils import fetch_html, logger
+from scraper.browser_manager import render_page, extract_with_playwright, BrowserConfig
 
 class TemuAdapter(ProductAdapter):
     name: str = "Temu"
@@ -281,133 +280,109 @@ class TemuAdapter(ProductAdapter):
 
     def _discover_via_playwright(self, url: str, max_products: Optional[int] = None) -> List[Dict[str, Any]]:
         """Uses Playwright headless browser to load dynamic Temu page and extract product cards."""
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            logger.warning("Playwright not installed, skipping browser discovery.")
-            return []
-
-        products: List[Dict[str, Any]] = []
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
-                )
-                context = browser.new_context(
-                    user_agent=config.USER_AGENT,
-                    viewport={"width": 1920, "height": 1080},
-                    extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
-                )
-                page = context.new_page()
-                
+        browser_config = BrowserConfig(timeout=30000)
+        
+        def extract(page):
+            # Dismiss potential popups
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            
+            # Scroll down in increments to trigger lazy-loaded goods
+            for _ in range(3):
                 try:
-                    page.goto(url, wait_until="commit", timeout=30000)
-                except Exception as goto_err:
-                    logger.debug(f"Playwright goto warning for Temu: {goto_err}")
-                
-                page.wait_for_timeout(4000)
-
-                # Dismiss potential popups
-                try:
-                    page.keyboard.press("Escape")
+                    page.evaluate("window.scrollBy(0, 1000)")
+                    page.wait_for_timeout(1500)
                 except Exception:
                     pass
-                
-                # Scroll down in increments to trigger lazy-loaded goods
-                for _ in range(3):
-                    try:
-                        page.evaluate("window.scrollBy(0, 1000)")
-                        page.wait_for_timeout(1500)
-                    except Exception:
-                        pass
+            
+            content = page.content()
+            soup = BeautifulSoup(content, "html.parser")
+            cards = soup.select("[data-testid*='goods'], [class*='_2rn4l'], [class*='goods-item'], div[data-goods-id], a[href*='goods']")
+            
+            if not cards:
+                cards = soup.select("div[class*='product'], div[class*='item'], div[class*='card'], a[href*='g-']")
 
-                content = page.content()
-                browser.close()
+            products: List[Dict[str, Any]] = []
+            for c in cards:
+                if c.name == "a":
+                    href = c.get("href", "")
+                    name = c.get("title") or c.get_text(strip=True)
+                    full_link = urljoin(url, href) if href else url
+                    img = c.find("img")
+                    img_src = (img.get("src") or img.get("data-src") or "") if img else ""
+                    if name and len(name) > 3:
+                        products.append({
+                            "product_name": name,
+                            "product_url": full_link,
+                            "image_url": img_src,
+                        })
+                else:
+                    name_el = c.find(["h2", "h3", "h4", "span", "p", "a"], class_=lambda cl: cl and any(k in str(cl).lower() for k in ["title", "name", "desc"]))
+                    name = name_el.get_text(strip=True) if name_el else ""
 
-                # Parse rendered cards
-                soup = BeautifulSoup(content, "html.parser")
-                cards = soup.select("[data-testid*='goods'], [class*='_2rn4l'], [class*='goods-item'], div[data-goods-id], a[href*='goods']")
-                
-                if not cards:
-                    cards = soup.select("div[class*='product'], div[class*='item'], div[class*='card'], a[href*='g-']")
+                    price_el = c.find(class_=lambda cl: cl and any(k in str(cl).lower() for k in ["price", "amount", "sale"]))
+                    price = price_el.get_text(strip=True) if price_el else ""
 
-                for c in cards:
-                    if c.name == "a":
-                        href = c.get("href", "")
-                        name = c.get("title") or c.get_text(strip=True)
-                        full_link = urljoin(url, href) if href else url
-                        img = c.find("img")
-                        img_src = (img.get("src") or img.get("data-src") or "") if img else ""
-                        if name and len(name) > 3:
-                            products.append({
-                                "product_name": name,
-                                "product_url": full_link,
-                                "image_url": img_src,
-                            })
-                    else:
-                        name_el = c.find(["h2", "h3", "h4", "span", "p", "a"], class_=lambda cl: cl and any(k in str(cl).lower() for k in ["title", "name", "desc"]))
-                        name = name_el.get_text(strip=True) if name_el else ""
+                    link = c.find("a", href=True)
+                    href = link["href"] if link else ""
+                    full_link = urljoin(url, href) if href else url
 
-                        price_el = c.find(class_=lambda cl: cl and any(k in str(cl).lower() for k in ["price", "amount", "sale"]))
-                        price = price_el.get_text(strip=True) if price_el else ""
+                    img = c.find("img")
+                    img_src = (img.get("src") or img.get("data-src") or "") if img else ""
 
-                        link = c.find("a", href=True)
-                        href = link["href"] if link else ""
-                        full_link = urljoin(url, href) if href else url
+                    if name and len(name) > 3:
+                        products.append({
+                            "product_name": name,
+                            "price": price,
+                            "product_url": full_link,
+                            "image_url": img_src,
+                        })
 
-                        img = c.find("img")
-                        img_src = (img.get("src") or img.get("data-src") or "") if img else ""
-
-                        if name and len(name) > 3:
-                            products.append({
-                                "product_name": name,
-                                "price": price,
-                                "product_url": full_link,
-                                "image_url": img_src,
-                            })
-
-                    if max_products and len(products) >= max_products:
-                        break
-
-        except Exception as e:
-            logger.warning(f"Playwright Temu discovery error: {e}")
-
-        return products
+                if max_products and len(products) >= max_products:
+                    break
+            
+            return products
+        
+        return extract_with_playwright(
+            url=url,
+            extract_fn=extract,
+            config=browser_config,
+            wait_until="commit"
+        ) or []
 
     def _extract_via_playwright(self, url: str) -> Optional[Dict[str, Any]]:
         """Renders single Temu product page with Playwright."""
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-                context = browser.new_context(user_agent=config.USER_AGENT, viewport={"width": 1920, "height": 1080})
-                page = context.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                page.wait_for_timeout(3000)
-                content = page.content()
-                browser.close()
+        browser_config = BrowserConfig(timeout=45000)
+        
+        def extract(page):
+            page.wait_for_timeout(3000)
+            content = page.content()
+            soup = BeautifulSoup(content, "html.parser")
+            title_el = soup.find(["h1", "h2"])
+            title = title_el.get_text(strip=True) if title_el else ""
+            
+            price_match = re.search(r'[\$\€\£\₹\¥]\s*[\d,]+\.?\d*', content)
+            price = price_match.group(0) if price_match else ""
 
-                soup = BeautifulSoup(content, "html.parser")
-                title_el = soup.find(["h1", "h2"])
-                title = title_el.get_text(strip=True) if title_el else ""
-                
-                price_match = re.search(r'[\$\€\£\₹\¥]\s*[\d,]+\.?\d*', content)
-                price = price_match.group(0) if price_match else ""
+            img = soup.find("img", src=True)
+            img_src = img["src"] if img else ""
 
-                img = soup.find("img", src=True)
-                img_src = img["src"] if img else ""
-
-                return {
-                    "product_name": title,
-                    "title": title,
-                    "price": price,
-                    "image_url": img_src,
-                    "product_url": url,
-                }
-        except Exception as e:
-            logger.warning(f"Playwright single product error: {e}")
-            return None
+            return {
+                "product_name": title,
+                "title": title,
+                "price": price,
+                "image_url": img_src,
+                "product_url": url,
+            }
+        
+        return extract_with_playwright(
+            url=url,
+            extract_fn=extract,
+            config=browser_config,
+            wait_until="domcontentloaded"
+        )
 
     def _normalize_temu_item(self, item: Dict[str, Any], source_url: str) -> Dict[str, Any]:
         """Normalizes Temu raw dictionary into the Universal Schema."""
@@ -423,30 +398,52 @@ class TemuAdapter(ProductAdapter):
         norm_o = normalize_price(orig_val)
         disc = calculate_discount_percentage(norm_o, norm_p) if norm_o and norm_p and norm_o > norm_p else ""
 
+        # Determine availability from extracted data, don't assume
+        availability = item.get("availability") or item.get("stock_status") or ""
+        stock_status = availability
+
+        # Currency detection from price
+        currency = item.get("currency") or ""
+        if not currency and price_val:
+            price_str = str(price_val)
+            if "$" in price_str:
+                currency = "USD"
+            elif "PKR" in price_str.upper() or "RS" in price_str.upper():
+                currency = "PKR"
+
         payload = {
             "source_domain": "temu.com",
             "source_url": source_url or product_url,
             "product_id": gid,
-            "sku": gid or f"TEMU-{gid}",
+            "sku": gid,  # Don't fabricate SKU if not provided
             "product_name": name,
             "title": name,
             "description": item.get("description", ""),
-            "brand": "Temu",
-            "vendor": "Temu Marketplace",
-            "category": item.get("category", "General"),
+            "brand": item.get("brand") or "",  # Don't hardcode
+            "vendor": item.get("vendor") or "",  # Don't hardcode
+            "category": item.get("category") or "",  # Don't hardcode
             "product_url": product_url,
             "price": norm_p if norm_p is not None else price_val,
             "sale_price": norm_p if norm_p is not None else price_val,
             "original_price": norm_o if norm_o is not None else "",
             "discount_percentage": disc,
-            "currency": "USD" if "$" in str(price_val) else ("PKR" if "PKR" in str(price_val) or "RS" in str(price_val).upper() else ""),
-            "availability": "In Stock",
-            "stock_status": "In Stock",
+            "currency": currency,
+            "availability": availability,
+            "stock_status": stock_status,
             "main_image": main_img,
             "image_url": main_img,
             "additional_images": item.get("additional_images", ""),
             "all_images": main_img,
             "rating": str(item.get("rating", "")),
             "sold_count": str(item.get("sales_tip") or item.get("sold_count", "")),
+            # Provenance
+            "price_source": "embedded_json" if item.get("price") else "meta_tag",
+            "title_source": "og:title" if item.get("product_name") else "html",
+            "image_source": "og:image" if item.get("image_url") else "html",
+            "sku_source": "goods_id" if gid else "not_found",
+            "description_source": "og:description" if item.get("description") else "not_found",
+            "availability_source": "extracted" if availability else "not_found",
+            "category_source": "extracted" if item.get("category") else "not_found",
+            "variants_source": "not_found",
         }
         return normalize_universal_product(payload, source_url=source_url or product_url)

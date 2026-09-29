@@ -1,5 +1,6 @@
 import argparse
 import sys
+import uuid
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -48,6 +49,11 @@ def run_universal_scrape(args):
     logger.info(f"Extraction Method:  {analysis.get('extraction_method')}")
     logger.info("-------------------------------------------")
 
+    job_id = uuid.uuid4().hex[:12]
+    job_paths = config.get_job_paths(job_id)
+    logger.info(f"Job ID: {job_id}")
+    logger.info(f"Output directory: {job_paths['job_dir']}")
+
     result = engine.scrape_url(
         url=args.url,
         max_products=max_count,
@@ -55,13 +61,18 @@ def run_universal_scrape(args):
         use_browser=args.browser,
         extract_images=not args.no_images,
         extract_variants=not args.no_variants,
-        resume=args.resume
+        resume=args.resume,
+        csv_path=job_paths["csv"],
+        json_path=job_paths["json"],
+        report_path=job_paths["report"],
+        job_id=job_id
     )
 
     if result.get("success"):
         stats = result.get("stats", {})
         logger.info("===========================================")
         logger.info("Scrape Completed Successfully!")
+        logger.info(f"Job ID: {job_id}")
         logger.info(f"Discovered: {stats.get('discovered')}")
         logger.info(f"Extracted:  {stats.get('scraped')}")
         logger.info(f"Failed:     {stats.get('failed')}")
@@ -79,6 +90,11 @@ def run_legacy_catalog_scrape(args):
     logger.info("===========================================")
     logger.info(f"Starting Catalog Product Scraper: {config.BASE_URL}")
     logger.info("===========================================")
+
+    job_id = uuid.uuid4().hex[:12]
+    job_paths = config.get_job_paths(job_id)
+    logger.info(f"Job ID: {job_id}")
+    logger.info(f"Output directory: {job_paths['job_dir']}")
 
     discovery = CatalogDiscovery()
     raw_products = discovery.discover_all_products(category_filter=args.category)
@@ -99,7 +115,7 @@ def run_legacy_catalog_scrape(args):
 
     if args.resume:
         logger.info("Resuming scrape from progress.json...")
-        progress_data = load_progress()
+        progress_data = load_progress(job_paths["progress"])
         scraped_products = progress_data.get("scraped_products", [])
         scraped_ids = set(progress_data.get("scraped_ids", []))
         failed_count = progress_data.get("failed_count", 0)
@@ -128,7 +144,7 @@ def run_legacy_catalog_scrape(args):
             failed_count += 1
 
         if idx % 10 == 0 or idx == total_to_scrape:
-            save_progress(list(scraped_ids), scraped_products, failed_count, source_url=config.BASE_URL)
+            save_progress(list(scraped_ids), scraped_products, failed_count, source_url=config.BASE_URL, filepath=job_paths["progress"])
 
     clean_products, duplicates_removed = deduplicate_products(scraped_products)
 
@@ -142,10 +158,9 @@ def run_legacy_catalog_scrape(args):
     has_variants = sum(1 for p in clean_products if p.get("variants"))
 
     # Exports
-    export_to_csv(clean_products, config.FINAL_CSV_PATH)
-    export_to_csv(clean_products, config.UNIVERSAL_CSV_PATH)
-    export_to_json(clean_products, config.UNIVERSAL_JSON_PATH)
-    export_raw_to_csv(raw_saved_list, config.RAW_CSV_PATH)
+    export_to_csv(clean_products, job_paths["csv"])
+    export_to_json(clean_products, job_paths["json"])
+    export_raw_to_csv(raw_saved_list, job_paths["job_dir"] / "products_raw.csv")
 
     stats = {
         "url": config.BASE_URL,
@@ -162,16 +177,17 @@ def run_legacy_catalog_scrape(args):
         "missing_sku": missing_sku,
         "has_variants": has_variants
     }
-    generate_quality_report(stats, config.REPORT_TXT_PATH, url=config.BASE_URL)
+    generate_quality_report(stats, job_paths["report"], url=config.BASE_URL)
 
     logger.info("===========================================")
     logger.info("Scraping completed.")
+    logger.info(f"Job ID: {job_id}")
     logger.info(f"Products discovered: {total_discovered}")
     logger.info(f"Products scraped: {len(clean_products)}")
     logger.info(f"Failed: {failed_count}")
     logger.info(f"Duplicates removed: {duplicates_removed}")
-    logger.info(f"CSV saved to: {config.FINAL_CSV_PATH}")
-    logger.info(f"JSON saved to: {config.UNIVERSAL_JSON_PATH}")
+    logger.info(f"CSV saved to: {job_paths['csv']}")
+    logger.info(f"JSON saved to: {job_paths['json']}")
     logger.info("===========================================")
 
 def main():

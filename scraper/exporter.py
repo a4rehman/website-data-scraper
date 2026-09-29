@@ -11,13 +11,25 @@ def export_to_csv(products: List[Dict[str, Any]], filepath: Path) -> bool:
     """
     Exports a list of processed product dictionaries to UTF-8 CSV format using UNIVERSAL_CSV_COLUMNS.
     Handles quotes, commas, multiline strings, Urdu/Arabic/Chinese, and emojis cleanly.
+    Does not silently drop extra fields - includes all fields from products.
     """
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Collect all unique columns from all products
+        all_columns = set(CSV_COLUMNS)
+        for p in products:
+            all_columns.update(p.keys())
+        
+        # Sort columns for consistent ordering - priority columns first
+        priority_columns = list(CSV_COLUMNS)
+        extra_columns = sorted([c for c in all_columns if c not in CSV_COLUMNS])
+        fieldnames = priority_columns + extra_columns
+        
         with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(
                 f,
-                fieldnames=CSV_COLUMNS,
+                fieldnames=fieldnames,
                 quoting=csv.QUOTE_MINIMAL,
                 extrasaction="ignore"
             )
@@ -25,7 +37,7 @@ def export_to_csv(products: List[Dict[str, Any]], filepath: Path) -> bool:
             for p in products:
                 # Ensure every column is a string or number, not raw nested objects in CSV
                 row = {}
-                for col in CSV_COLUMNS:
+                for col in fieldnames:
                     val = p.get(col, "")
                     if isinstance(val, (dict, list)):
                         row[col] = json.dumps(val, ensure_ascii=False)
@@ -50,18 +62,17 @@ def export_to_json(products: List[Dict[str, Any]], filepath: Path) -> bool:
         formatted_products = []
         for p in products:
             item = dict(p)
-            # If variants is a JSON string, decode it for structured JSON representation
-            if isinstance(item.get("variants"), str) and item["variants"].startswith("["):
-                try:
-                    item["variants"] = json.loads(item["variants"])
-                except Exception:
-                    pass
-            # If specifications is a JSON string, decode it
-            if isinstance(item.get("specifications"), str) and item["specifications"].startswith(("{", "[")):
-                try:
-                    item["specifications"] = json.loads(item["specifications"])
-                except Exception:
-                    pass
+            # Fields that may be JSON strings - decode them for structured JSON
+            json_string_fields = [
+                "variants", "specifications", "all_images", "additional_images",
+                "colors", "sizes", "tags"
+            ]
+            for field in json_string_fields:
+                if isinstance(item.get(field), str) and item[field].strip().startswith(("{", "[")):
+                    try:
+                        item[field] = json.loads(item[field])
+                    except Exception:
+                        pass
             formatted_products.append(item)
 
         with open(filepath, "w", encoding="utf-8") as f:
@@ -98,7 +109,7 @@ def export_raw_to_csv(raw_products: List[Dict[str, Any]], filepath: Path) -> boo
 
 def load_progress(filepath: Optional[Path] = None) -> Dict[str, Any]:
     """
-    Loads saved progress state from data/progress.json.
+    Loads saved progress state from data/progress.json or job-specific path.
     """
     target = filepath or config.PROGRESS_JSON_PATH
     if target.exists():
@@ -117,10 +128,11 @@ def save_progress(
     filepath: Optional[Path] = None
 ):
     """
-    Saves current scraping progress state to data/progress.json.
+    Saves current scraping progress state to data/progress.json or job-specific path.
     """
     target = filepath or config.PROGRESS_JSON_PATH
     try:
+        target.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "url": source_url,
             "scraped_ids": list(scraped_ids),

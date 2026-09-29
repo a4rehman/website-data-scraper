@@ -247,7 +247,7 @@ class ShopifyAdapter(ProductAdapter):
                 f"Size: {v_size or v_title} | Color: {v_color} | Price: {v_price} | SKU: {v_sku} | Stock: {'In Stock' if v_avail else 'Out of Stock'}"
             )
 
-        primary_sku = skus[0] if skus else f"SKU-{product_id}"
+        primary_sku = skus[0] if skus else ""
         active_price = prices[0] if prices else ""
         original_price = compare_prices[0] if compare_prices else active_price
         
@@ -263,6 +263,10 @@ class ShopifyAdapter(ProductAdapter):
         colors_str = "|".join(sorted(list(colors_set)))
         material, pieces = extract_material_and_pieces(clean_desc + " " + title, tags_list)
 
+        # Availability from actual variant data
+        availability = "In Stock" if any_in_stock else "Out of Stock"
+        stock_status = availability
+
         product_dict = {
             "source_url": source_url or product_url,
             "product_id": product_id,
@@ -272,7 +276,7 @@ class ShopifyAdapter(ProductAdapter):
             "description": clean_desc,
             "brand": vendor,
             "vendor": vendor,
-            "category": product_type or "General",
+            "category": product_type or "",
             "subcategory": pieces or "",
             "product_type": product_type,
             "tags": tags_str,
@@ -281,8 +285,8 @@ class ShopifyAdapter(ProductAdapter):
             "sale_price": sale_price,
             "original_price": original_price,
             "discount_percentage": discount_pct,
-            "availability": "In Stock" if any_in_stock else "Out of Stock",
-            "stock_status": "In Stock" if any_in_stock else "Out of Stock",
+            "availability": availability,
+            "stock_status": stock_status,
             "colors": colors_str,
             "sizes": sizes_str,
             "material": material,
@@ -293,5 +297,14 @@ class ShopifyAdapter(ProductAdapter):
             "image_url": main_img,
             "additional_images": add_imgs,
             "all_images": all_imgs,
+            # Provenance
+            "price_source": "shopify_json.variants[0].price",
+            "title_source": "shopify_json.title",
+            "image_source": "shopify_json.images[0].src",
+            "sku_source": "shopify_json.variants[0].sku" if skus else "not_found",
+            "description_source": "shopify_json.body_html",
+            "availability_source": "shopify_json.variants[].available",
+            "category_source": "shopify_json.product_type",
+            "variants_source": "shopify_json.variants",
         }
         return normalize_universal_product(product_dict, source_url=source_url or product_url)

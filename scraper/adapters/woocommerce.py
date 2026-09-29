@@ -138,7 +138,7 @@ class WooCommerceAdapter(ProductAdapter):
 
         # Categories
         categories = [c.get("name", "") for c in raw.get("categories", []) if c.get("name")]
-        cat_str = " > ".join(categories) if categories else "General"
+        cat_str = " > ".join(categories) if categories else ""
 
         # Attributes (Sizes, Colors, Specs)
         attributes = raw.get("attributes", [])
@@ -169,21 +169,26 @@ class WooCommerceAdapter(ProductAdapter):
             }
             var_dicts.append(v_data)
 
+        # Availability from actual data
+        is_in_stock = raw.get("is_in_stock", True)
+        availability = "In Stock" if is_in_stock else "Out of Stock"
+        stock_status = availability
+
         item = {
             "source_url": source_url or permalink,
             "product_id": product_id,
-            "sku": sku or f"WC-{product_id}",
+            "sku": sku,
             "product_name": name,
             "title": name,
             "description": desc,
-            "brand": "",
+            "brand": raw.get("brand", ""),
             "category": cat_str,
             "product_url": permalink,
             "price": norm_price or "",
             "original_price": norm_orig or norm_price or "",
             "currency": currency,
-            "availability": "In Stock" if raw.get("is_in_stock", True) else "Out of Stock",
-            "stock_status": "In Stock" if raw.get("is_in_stock", True) else "Out of Stock",
+            "availability": availability,
+            "stock_status": stock_status,
             "colors": "|".join(colors),
             "sizes": "|".join(sizes),
             "variants": var_dicts,
@@ -193,6 +198,15 @@ class WooCommerceAdapter(ProductAdapter):
             "additional_images": add_imgs,
             "all_images": all_imgs,
             "specifications": specs,
+            # Provenance
+            "price_source": "wc_store_api.prices.price",
+            "title_source": "wc_store_api.name",
+            "image_source": "wc_store_api.images[0].src",
+            "sku_source": "wc_store_api.sku" if sku else "not_found",
+            "description_source": "wc_store_api.description",
+            "availability_source": "wc_store_api.is_in_stock",
+            "category_source": "wc_store_api.categories",
+            "variants_source": "wc_store_api.variations",
         }
         return normalize_universal_product(item, source_url=source_url or permalink)
 
@@ -221,7 +235,7 @@ class WooCommerceAdapter(ProductAdapter):
 
         # Category breadcrumbs
         cat_links = [a.get_text(strip=True) for a in soup.select(".woocommerce-breadcrumb a, .posted_in a")]
-        cat_str = " > ".join(cat_links[1:]) if len(cat_links) > 1 else (cat_links[0] if cat_links else "General")
+        cat_str = " > ".join(cat_links[1:]) if len(cat_links) > 1 else (cat_links[0] if cat_links else "")
 
         # Images
         img_els = soup.select(".woocommerce-product-gallery img, .wp-post-image")
@@ -245,6 +259,17 @@ class WooCommerceAdapter(ProductAdapter):
             except Exception:
                 pass
 
+        # Determine availability from stock indicator
+        stock_el = soup.select_one(".stock.in-stock, .stock.out-of-stock, .availability")
+        in_stock = True
+        if stock_el:
+            stock_text = stock_el.get_text(strip=True).lower()
+            if "out of stock" in stock_text or "outofstock" in stock_text:
+                in_stock = False
+
+        availability = "In Stock" if in_stock else "Out of Stock"
+        stock_status = availability
+
         item = {
             "source_url": url,
             "product_id": sku or "",
@@ -255,13 +280,22 @@ class WooCommerceAdapter(ProductAdapter):
             "category": cat_str,
             "product_url": url,
             "price": price_str,
-            "availability": "In Stock",
-            "stock_status": "In Stock",
+            "availability": availability,
+            "stock_status": stock_status,
             "variants": var_dicts,
             "variant_count": len(var_dicts),
             "main_image": main_img,
             "image_url": main_img,
             "additional_images": add_imgs,
             "all_images": all_imgs,
+            # Provenance
+            "price_source": "html.price",
+            "title_source": "html.h1.product_title",
+            "image_source": "html.woocommerce-product-gallery",
+            "sku_source": "html.sku_wrapper" if sku else "not_found",
+            "description_source": "html.woocommerce-product-details__short-description",
+            "availability_source": "html.stock" if stock_el else "not_found",
+            "category_source": "html.breadcrumb" if cat_links else "not_found",
+            "variants_source": "html.variations_form" if var_dicts else "not_found",
         }
         return normalize_universal_product(item, source_url=url)

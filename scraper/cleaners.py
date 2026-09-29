@@ -277,6 +277,16 @@ def normalize_universal_product(data: Dict[str, Any], source_url: str = "") -> D
     # Timestamp
     scraped_at = data.get("scraped_at") or datetime.now(timezone.utc).isoformat()
 
+    # Provenance (source tracking) - empty by default, to be populated by adapters
+    price_source = data.get("price_source") or ""
+    title_source = data.get("title_source") or ""
+    image_source = data.get("image_source") or ""
+    sku_source = data.get("sku_source") or ""
+    description_source = data.get("description_source") or ""
+    availability_source = data.get("availability_source") or ""
+    category_source = data.get("category_source") or ""
+    variants_source = data.get("variants_source") or ""
+
     return {
         "source_domain": source_domain,
         "source_url": source_url or target_url,
@@ -321,6 +331,15 @@ def normalize_universal_product(data: Dict[str, Any], source_url: str = "") -> D
         "sold_count": str(data.get("sold_count") or ""),
         "shipping_information": str(data.get("shipping_information") or ""),
         "scraped_at": scraped_at,
+        # Provenance fields
+        "price_source": price_source,
+        "title_source": title_source,
+        "image_source": image_source,
+        "sku_source": sku_source,
+        "description_source": description_source,
+        "availability_source": availability_source,
+        "category_source": category_source,
+        "variants_source": variants_source,
     }
 
 def deduplicate_products(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:

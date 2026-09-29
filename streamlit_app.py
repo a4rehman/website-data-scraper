@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import time
 import threading
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -85,6 +86,10 @@ if "last_scrape_results" not in st.session_state:
     st.session_state.last_scrape_results = None
 if "ai_summary_result" not in st.session_state:
     st.session_state.ai_summary_result = None
+if "current_job_id" not in st.session_state:
+    st.session_state.current_job_id = None
+if "current_job_paths" not in st.session_state:
+    st.session_state.current_job_paths = None
 
 stop_event = threading.Event()
 
@@ -214,7 +219,7 @@ if st.session_state.url_analysis:
 # ---------------------------------------------------------------------------
 # Background Scraping Task Runner
 # ---------------------------------------------------------------------------
-def run_scrape_worker(target_url, max_p, delay, browser, imgs, vars_flag, descs, resume_flag):
+def run_scrape_worker(target_url, max_p, delay, browser, imgs, vars_flag, descs, resume_flag, job_id):
     engine = UniversalScrapingEngine()
 
     def update_progress(data: Dict[str, Any]):
@@ -238,11 +243,14 @@ def run_scrape_worker(target_url, max_p, delay, browser, imgs, vars_flag, descs,
             extract_descriptions=descs,
             resume=resume_flag,
             progress_callback=update_progress,
-            stop_event=stop_event
+            stop_event=stop_event,
+            job_id=job_id
         )
         st.session_state.last_scrape_results = results
         if results.get("success"):
             st.session_state.current_status = f"✅ Completed! Extracted {len(results.get('products', []))} products."
+            st.session_state.current_job_id = results.get("job_id")
+            st.session_state.current_job_paths = results.get("job_paths")
         else:
             st.session_state.current_status = f"⚠️ {results.get('message', 'Extraction ended.')}"
     except Exception as e:
@@ -258,9 +266,12 @@ if start_btn:
         if not is_safe:
             st.error(f"⚠️ Access Blocked: {reason}")
         else:
+            # Generate new job ID for this scrape
+            job_id = uuid.uuid4().hex[:12]
             st.session_state.progress_count = 0
             st.session_state.total_target = 0
             st.session_state.ai_summary_result = None
+            st.session_state.current_job_id = job_id
 
             worker_thread = threading.Thread(
                 target=run_scrape_worker,
@@ -273,6 +284,7 @@ if start_btn:
                     extract_variants_val,
                     extract_descriptions_val,
                     resume_val,
+                    job_id,
                 ),
                 daemon=True
             )
@@ -319,9 +331,16 @@ dupes_val = 0
 missing_price_val = 0
 missing_img_val = 0
 
-if config.REPORT_TXT_PATH.exists():
+# Use job-specific paths if available, otherwise fall back to defaults
+report_path = None
+if st.session_state.current_job_paths and "report" in st.session_state.current_job_paths:
+    report_path = st.session_state.current_job_paths["report"]
+elif config.REPORT_TXT_PATH.exists():
+    report_path = config.REPORT_TXT_PATH
+
+if report_path and report_path.exists():
     try:
-        report_text = config.REPORT_TXT_PATH.read_text(encoding="utf-8")
+        report_text = report_path.read_text(encoding="utf-8")
         for line in report_text.splitlines():
             if "Total Products Discovered:" in line:
                 discovered_val = int(line.split(":")[-1].strip())
@@ -361,10 +380,18 @@ tab_preview, tab_json, tab_ai, tab_report, tab_logs = st.tabs([
 ])
 
 with tab_preview:
-    active_csv = config.UNIVERSAL_CSV_PATH if config.UNIVERSAL_CSV_PATH.exists() else config.FINAL_CSV_PATH
-    if active_csv.exists() and active_csv.stat().st_size > 50:
+    # Use job-specific CSV path if available
+    csv_path = None
+    if st.session_state.current_job_paths and "csv" in st.session_state.current_job_paths:
+        csv_path = st.session_state.current_job_paths["csv"]
+    elif config.UNIVERSAL_CSV_PATH.exists():
+        csv_path = config.UNIVERSAL_CSV_PATH
+    elif config.FINAL_CSV_PATH.exists():
+        csv_path = config.FINAL_CSV_PATH
+    
+    if csv_path and csv_path.exists() and csv_path.stat().st_size > 50:
         try:
-            df = pd.read_csv(active_csv, encoding="utf-8-sig")
+            df = pd.read_csv(csv_path, encoding="utf-8-sig")
             st.write(f"Displaying **{len(df)}** extracted products:")
             
             preview_cols = [
@@ -384,9 +411,15 @@ with tab_preview:
         st.info("No scraped dataset available yet. Paste a URL and click 'Start Extraction' above.")
 
 with tab_json:
-    if config.UNIVERSAL_JSON_PATH.exists() and config.UNIVERSAL_JSON_PATH.stat().st_size > 10:
+    json_path = None
+    if st.session_state.current_job_paths and "json" in st.session_state.current_job_paths:
+        json_path = st.session_state.current_job_paths["json"]
+    elif config.UNIVERSAL_JSON_PATH.exists():
+        json_path = config.UNIVERSAL_JSON_PATH
+    
+    if json_path and json_path.exists() and json_path.stat().st_size > 10:
         try:
-            with open(config.UNIVERSAL_JSON_PATH, "r", encoding="utf-8") as jf:
+            with open(json_path, "r", encoding="utf-8") as jf:
                 raw_json = json.load(jf)
                 st.write(f"Structured JSON tree ({len(raw_json)} items):")
                 st.json(raw_json[:5] if len(raw_json) > 5 else raw_json)
@@ -398,10 +431,16 @@ with tab_json:
 with tab_ai:
     st.write("### 🤖 AI Catalog Insights")
     if st.button("✨ Generate AI Catalog Analysis", key="btn_ai_gen"):
-        if config.UNIVERSAL_JSON_PATH.exists() and config.UNIVERSAL_JSON_PATH.stat().st_size > 10:
+        json_path = None
+        if st.session_state.current_job_paths and "json" in st.session_state.current_job_paths:
+            json_path = st.session_state.current_job_paths["json"]
+        elif config.UNIVERSAL_JSON_PATH.exists():
+            json_path = config.UNIVERSAL_JSON_PATH
+        
+        if json_path and json_path.exists() and json_path.stat().st_size > 10:
             with st.spinner("Analyzing catalog text with AI..."):
                 try:
-                    with open(config.UNIVERSAL_JSON_PATH, "r", encoding="utf-8") as jf:
+                    with open(json_path, "r", encoding="utf-8") as jf:
                         products_data = json.load(jf)
                     summary_text = "\n".join([
                         f"Title: {p.get('product_name')} | Price: {p.get('price')} {p.get('currency')} | Category: {p.get('category')} | Brand: {p.get('brand')}"
@@ -428,15 +467,27 @@ with tab_ai:
             st.error(f"AI Analysis Notice: {res.get('error')}")
 
 with tab_report:
-    if config.REPORT_TXT_PATH.exists():
-        st.code(config.REPORT_TXT_PATH.read_text(encoding="utf-8"), language="text")
+    report_path = None
+    if st.session_state.current_job_paths and "report" in st.session_state.current_job_paths:
+        report_path = st.session_state.current_job_paths["report"]
+    elif config.REPORT_TXT_PATH.exists():
+        report_path = config.REPORT_TXT_PATH
+    
+    if report_path and report_path.exists():
+        st.code(report_path.read_text(encoding="utf-8"), language="text")
     else:
         st.info("No quality report available yet.")
 
 with tab_logs:
-    if config.LOG_FILE_PATH.exists():
+    log_path = None
+    if st.session_state.current_job_paths and "logs" in st.session_state.current_job_paths:
+        log_path = st.session_state.current_job_paths["logs"]
+    elif config.LOG_FILE_PATH.exists():
+        log_path = config.LOG_FILE_PATH
+    
+    if log_path and log_path.exists():
         try:
-            log_lines = config.LOG_FILE_PATH.read_text(encoding="utf-8").splitlines()
+            log_lines = log_path.read_text(encoding="utf-8").splitlines()
             st.code("\n".join(log_lines[-40:]), language="text")
         except Exception:
             st.info("Logs empty.")
@@ -449,14 +500,40 @@ with tab_logs:
 st.markdown("---")
 st.subheader("📥 Export Center")
 
+# Determine paths from current job or fallback
+csv_path = None
+if st.session_state.current_job_paths and "csv" in st.session_state.current_job_paths:
+    csv_path = st.session_state.current_job_paths["csv"]
+elif config.UNIVERSAL_CSV_PATH.exists():
+    csv_path = config.UNIVERSAL_CSV_PATH
+elif config.FINAL_CSV_PATH.exists():
+    csv_path = config.FINAL_CSV_PATH
+
+json_path = None
+if st.session_state.current_job_paths and "json" in st.session_state.current_job_paths:
+    json_path = st.session_state.current_job_paths["json"]
+elif config.UNIVERSAL_JSON_PATH.exists():
+    json_path = config.UNIVERSAL_JSON_PATH
+
+report_path = None
+if st.session_state.current_job_paths and "report" in st.session_state.current_job_paths:
+    report_path = st.session_state.current_job_paths["report"]
+elif config.REPORT_TXT_PATH.exists():
+    report_path = config.REPORT_TXT_PATH
+
+log_path = None
+if st.session_state.current_job_paths and "logs" in st.session_state.current_job_paths:
+    log_path = st.session_state.current_job_paths["logs"]
+elif config.LOG_FILE_PATH.exists():
+    log_path = config.LOG_FILE_PATH
+
 d_col1, d_col2, d_col3, d_col4 = st.columns(4)
 
 with d_col1:
-    csv_file = config.UNIVERSAL_CSV_PATH if config.UNIVERSAL_CSV_PATH.exists() else config.FINAL_CSV_PATH
-    if csv_file.exists() and csv_file.stat().st_size > 10:
+    if csv_path and csv_path.exists() and csv_path.stat().st_size > 10:
         st.download_button(
             label="📥 Download CSV Dataset",
-            data=csv_file.read_bytes(),
+            data=csv_path.read_bytes(),
             file_name="products.csv",
             mime="text/csv",
             use_container_width=True
@@ -465,10 +542,10 @@ with d_col1:
         st.button("📥 Download CSV", disabled=True, use_container_width=True)
 
 with d_col2:
-    if config.UNIVERSAL_JSON_PATH.exists() and config.UNIVERSAL_JSON_PATH.stat().st_size > 10:
+    if json_path and json_path.exists() and json_path.stat().st_size > 10:
         st.download_button(
             label="📥 Download JSON Dataset",
-            data=config.UNIVERSAL_JSON_PATH.read_bytes(),
+            data=json_path.read_bytes(),
             file_name="products.json",
             mime="application/json",
             use_container_width=True
@@ -477,10 +554,10 @@ with d_col2:
         st.button("📥 Download JSON", disabled=True, use_container_width=True)
 
 with d_col3:
-    if config.REPORT_TXT_PATH.exists():
+    if report_path and report_path.exists():
         st.download_button(
             label="📄 Download Scrape Report",
-            data=config.REPORT_TXT_PATH.read_bytes(),
+            data=report_path.read_bytes(),
             file_name="scrape_report.txt",
             mime="text/plain",
             use_container_width=True
@@ -489,10 +566,10 @@ with d_col3:
         st.button("📄 Download Report", disabled=True, use_container_width=True)
 
 with d_col4:
-    if config.LOG_FILE_PATH.exists():
+    if log_path and log_path.exists():
         st.download_button(
             label="📜 Download Log File",
-            data=config.LOG_FILE_PATH.read_bytes(),
+            data=log_path.read_bytes(),
             file_name="scraper.log",
             mime="text/plain",
             use_container_width=True

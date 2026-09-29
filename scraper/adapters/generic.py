@@ -13,6 +13,8 @@ from scraper.cleaners import (
     clean_html_description
 )
 from scraper.utils import fetch_html, logger
+from scraper.pagination import discover_with_pagination
+from scraper.browser_manager import render_page, extract_with_playwright, BrowserConfig
 
 class GenericAdapter(ProductAdapter):
     name: str = "Generic E-Commerce"
@@ -74,61 +76,60 @@ class GenericAdapter(ProductAdapter):
             return [url]
 
         logger.info(f"GenericAdapter: Discovering products from {url}")
-        html = fetch_html(url)
-        if not html:
+        
+        # Define product extraction function for pagination engine
+        def extract_from_page(page_url: str) -> List[Dict[str, Any]]:
+            html = fetch_html(page_url)
+            if not html:
+                return []
+            
+            soup = BeautifulSoup(html, "html.parser")
+            items: List[Dict[str, Any]] = []
+            
+            # Strategy 1: JSON-LD ItemList
+            jsonld_items = self._extract_jsonld_listing(soup, page_url)
+            if jsonld_items:
+                items.extend(jsonld_items)
+            
+            # Strategy 2: Next.js __NEXT_DATA__
+            if not items:
+                next_items = self._extract_nextjs_data(soup, page_url)
+                if next_items:
+                    items.extend(next_items)
+            
+            # Strategy 3: HTML Product Link / Card Discovery
+            if not items:
+                cards = self._extract_html_product_cards(soup, page_url)
+                if cards:
+                    items.extend(cards)
+            
+            # Strategy 4: Fallback to link crawler
+            if not items:
+                seen_links = set()
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    full_link = urljoin(page_url, href)
+                    parsed_link = urlparse(full_link)
+                    if parsed_link.netloc == parsed.netloc:
+                        if any(kw in parsed_link.path.lower() for kw in ["/product/", "/p/", "/item/", "/goods/"]):
+                            if full_link not in seen_links:
+                                seen_links.add(full_link)
+                                items.append({"product_url": full_link})
+            
+            return items
+        
+        # Use pagination engine to discover across all pages
+        discovered_items = discover_with_pagination(
+            url=url,
+            extract_products_fn=extract_from_page,
+            max_products=max_products,
+            use_browser=use_browser
+        )
+        
+        if not discovered_items:
+            logger.warning(f"No listing items discovered on {url}. Retaining target URL.")
             return [url]
-
-        soup = BeautifulSoup(html, "html.parser")
-        discovered_items: List[Any] = []
-        seen_links = set()
-
-        # Strategy 1: JSON-LD ItemList
-        jsonld_items = self._extract_jsonld_listing(soup, url)
-        if jsonld_items:
-            logger.info(f"GenericAdapter: Found {len(jsonld_items)} items via JSON-LD ItemList")
-            discovered_items.extend(jsonld_items)
-
-        # Strategy 2: Next.js __NEXT_DATA__
-        if not discovered_items:
-            next_items = self._extract_nextjs_data(soup, url)
-            if next_items:
-                logger.info(f"GenericAdapter: Found {len(next_items)} items via Next.js hydration data")
-                discovered_items.extend(next_items)
-
-        # Strategy 3: HTML Product Link / Card Discovery
-        if not discovered_items:
-            cards = self._extract_html_product_cards(soup, url)
-            if cards:
-                logger.info(f"GenericAdapter: Found {len(cards)} product cards via semantic HTML selectors")
-                discovered_items.extend(cards)
-
-        # Strategy 4: Fallback to link crawler looking for product URL patterns
-        if not discovered_items:
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                full_link = urljoin(url, href)
-                parsed_link = urlparse(full_link)
-                # Ensure same domain
-                if parsed_link.netloc == parsed.netloc:
-                    if any(kw in parsed_link.path.lower() for kw in ["/product/", "/p/", "/item/", "/goods/"]):
-                        if full_link not in seen_links:
-                            seen_links.add(full_link)
-                            discovered_items.append(full_link)
-
-        # Strategy 5: Playwright browser fallback if requested or no products found
-        if (not discovered_items or use_browser) and len(discovered_items) < (max_products or 5):
-            logger.info("GenericAdapter: Trying Playwright headless browser extraction...")
-            browser_cards = self._discover_via_playwright(url, max_products=max_products)
-            if browser_cards:
-                discovered_items.extend(browser_cards)
-
-        if not discovered_items:
-            # Fallback to single URL
-            return [url]
-
-        if max_products and len(discovered_items) > max_products:
-            discovered_items = discovered_items[:max_products]
-
+        
         return discovered_items
 
     def extract_product(
@@ -204,7 +205,7 @@ class GenericAdapter(ProductAdapter):
         price = offers.get("price") or offers.get("lowPrice", "")
         curr = offers.get("priceCurrency", "")
         avail_str = str(offers.get("availability", ""))
-        avail = "In Stock" if "InStock" in avail_str else ("Out of Stock" if "OutOfStock" in avail_str else "In Stock")
+        avail = "In Stock" if "InStock" in avail_str else ("Out of Stock" if "OutOfStock" in avail_str else "")
 
         # Images
         raw_img = item.get("image", [])
@@ -231,6 +232,15 @@ class GenericAdapter(ProductAdapter):
             "image_url": main_img,
             "additional_images": add_imgs,
             "all_images": all_imgs,
+            # Provenance
+            "price_source": "jsonld.offers.price",
+            "title_source": "jsonld.name",
+            "image_source": "jsonld.image",
+            "sku_source": "jsonld.sku" if sku else "not_found",
+            "description_source": "jsonld.description",
+            "availability_source": "jsonld.offers.availability",
+            "category_source": "jsonld.category" if item.get("category") else "not_found",
+            "variants_source": "not_found",
         }
         return normalize_universal_product(payload, source_url=base_url)
 
@@ -295,70 +305,186 @@ class GenericAdapter(ProductAdapter):
             return normalize_universal_product(next_items[0], source_url=base_url)
         return None
 
+    def _score_product_candidate(self, card: BeautifulSoup, base_url: str) -> Optional[Dict[str, Any]]:
+        """
+        Scores a product candidate based on multiple signals.
+        Returns product dict if score is above threshold, else None.
+        """
+        score = 0
+        signals = {}
+        
+        # Signal 1: Product-like URL pattern (strong signal)
+        link_el = card.find("a", href=True)
+        link = urljoin(base_url, link_el["href"]) if link_el else ""
+        if link:
+            path = urlparse(link).path.lower()
+            if any(kw in path for kw in ["/product/", "/p/", "/item/", "/dp/", "/goods/", "/buy/"]):
+                score += 30
+                signals["url_pattern"] = True
+        
+        # Signal 2: Has product title/name
+        name_el = card.find(["h1", "h2", "h3", "h4", "h5", "h6", "a", "span", "p", "div"], 
+                            class_=lambda c: c and any(k in str(c).lower() for k in ["title", "name", "prod", "item"]))
+        name = name_el.get_text(strip=True) if name_el else ""
+        if not name and link_el:
+            name = link_el.get("title") or link_el.get_text(strip=True)
+        if name and len(name) >= 3:
+            score += 25
+            signals["has_name"] = True
+        
+        # Signal 3: Has price
+        price_el = card.find(class_=lambda c: c and any(k in str(c).lower() for k in ["price", "cost", "amount", "sale"]))
+        price = price_el.get_text(strip=True) if price_el else ""
+        if not price:
+            price_match = re.search(r'[\$\€\£\₹\¥]\s*[\d,]+\.?\d*', card.get_text())
+            price = price_match.group(0) if price_match else ""
+        if price:
+            score += 25
+            signals["has_price"] = True
+        
+        # Signal 4: Has image
+        img_el = card.find("img")
+        img = img_el.get("src") or img_el.get("data-src") or img_el.get("data-original") or img_el.get("data-lazy-src") or "" if img_el else ""
+        if img:
+            score += 15
+            signals["has_image"] = True
+        
+        # Signal 5: Add to cart / buy button
+        cart_el = card.find(class_=lambda c: c and any(k in str(c).lower() for k in ["cart", "buy", "add-to-cart", "atc", "purchase"]))
+        if cart_el or (link_el and any(k in link_el.get_text(strip=True).lower() for k in ["add to cart", "buy now", "add to bag"])):
+            score += 20
+            signals["has_cart_button"] = True
+        
+        # Signal 6: SKU / product ID
+        sku_el = card.find(class_=lambda c: c and any(k in str(c).lower() for k in ["sku", "product-id", "item-id", "data-id"]))
+        if sku_el or (link_el and link_el.get("data-product-id")):
+            score += 15
+            signals["has_sku"] = True
+        
+        # Signal 7: Semantic HTML / microdata
+        if card.find(itemprop="product") or card.find(itemtype=re.compile(r".*Product")):
+            score += 20
+            signals["has_microdata"] = True
+        
+        # Signal 8: Schema.org Product in card
+        if card.find("script", type="application/ld+json"):
+            try:
+                import json
+                data = json.loads(card.find("script", type="application/ld+json").string or "{}")
+                if data.get("@type") == "Product":
+                    score += 30
+                    signals["has_jsonld"] = True
+            except Exception:
+                pass
+        
+        # Minimum threshold
+        if score < 40:
+            return None
+        
+        return {
+            "product_name": name,
+            "title": name,
+            "price": price,
+            "product_url": link,
+            "image_url": img,
+            "_discovery_score": score,
+            "_discovery_signals": signals,
+        }
+
     def _extract_html_product_cards(self, soup: BeautifulSoup, base_url: str) -> List[Dict[str, Any]]:
         products = []
-        seen = set()
-
+        seen_urls = set()
+        seen_names = set()
+        
+        # Extended card selectors with more patterns
         card_selectors = [
+            # Modern data attributes
             "[data-testid*='product']", "[data-testid*='item']",
+            "[data-product-id]", "[data-item-id]", "[data-sku]",
+            # Common class patterns
             ".product-card", ".productCard", ".product_card", ".ProductCard",
             ".product-item", ".productItem", ".goods-item", ".search-item",
-            "article.product", "li.product"
+            ".product-tile", ".productTile", ".item-card", ".itemCard",
+            ".product-grid-item", ".product-list-item",
+            # Semantic HTML
+            "article.product", "li.product", "div.product",
+            # E-commerce specific
+            ".product", "[itemtype*='Product']", "[itemprop='itemListElement']",
+            # Framework patterns
+            ".MuiCard-root", ".ant-card", ".v-card", ".el-card",
         ]
-
+        
         cards = []
         for sel in card_selectors:
             found = soup.select(sel)
             if found and len(found) >= 2:
                 cards = found
+                logger.debug(f"Found {len(cards)} candidate cards with selector: {sel}")
                 break
-
+        
+        # Fallback: find all elements that look like product cards (repeated structures)
+        if not cards:
+            # Look for repeated divs/li with similar structure containing price-like text
+            all_containers = soup.find_all(["div", "li", "article"])
+            # Group by class pattern
+            class_groups = {}
+            for c in all_containers:
+                classes = " ".join(c.get("class", []))
+                if classes:
+                    class_groups.setdefault(classes, []).append(c)
+            
+            for cls, elements in class_groups.items():
+                if len(elements) >= 3:  # At least 3 similar elements
+                    cards = elements
+                    logger.debug(f"Found {len(cards)} candidate cards by class grouping: {cls}")
+                    break
+        
         for card in cards:
-            name_el = card.find(["h2", "h3", "h4", "a", "span"], class_=lambda c: c and any(k in str(c).lower() for k in ["title", "name", "prod"])) or card.find(["h2", "h3", "h4"])
-            name = name_el.get_text(strip=True) if name_el else ""
-
-            if not name or len(name) < 3 or name in seen:
-                continue
-            seen.add(name)
-
-            price_el = card.find(class_=lambda c: c and any(k in str(c).lower() for k in ["price", "cost", "amount", "sale"]))
-            price = price_el.get_text(strip=True) if price_el else ""
-            if not price:
-                price_match = re.search(r'[\$\€\£\₹\¥]\s*[\d,]+\.?\d*', card.get_text())
-                price = price_match.group(0) if price_match else ""
-
-            link_el = card.find("a", href=True)
-            link = urljoin(base_url, link_el["href"]) if link_el else base_url
-
-            img_el = card.find("img")
-            img = img_el.get("src") or img_el.get("data-src") or "" if img_el else ""
-
-            products.append({
-                "product_name": name,
-                "title": name,
-                "price": price,
-                "product_url": link,
-                "image_url": img,
-            })
-
+            candidate = self._score_product_candidate(card, base_url)
+            if candidate:
+                product_url = candidate.get("product_url", "")
+                product_name = candidate.get("product_name", "")
+                
+                # Deduplicate by URL or name
+                dedup_key = product_url or product_name
+                if dedup_key in seen_urls:
+                    continue
+                seen_urls.add(dedup_key)
+                
+                if product_name and product_name in seen_names:
+                    continue
+                seen_names.add(product_name)
+                
+                # Remove internal scoring fields
+                candidate.pop("_discovery_score", None)
+                candidate.pop("_discovery_signals", None)
+                
+                products.append(candidate)
+        
+        # Sort by score (highest first) - we lost the score, so just return as-is
+        logger.info(f"Extracted {len(products)} product cards via scoring-based discovery")
         return products
 
     def _extract_single_html(self, soup: BeautifulSoup, base_url: str) -> Dict[str, Any]:
         # Title
         title_el = soup.find("h1") or soup.find("meta", property="og:title")
         title = title_el.get("content", "") if title_el and title_el.name == "meta" else (title_el.get_text(strip=True) if title_el else "")
+        title_source = "og:title" if title_el and title_el.name == "meta" else ("h1" if title_el else "not_found")
 
         # Description
         desc_el = soup.find("meta", property="og:description") or soup.select_one(".product-description, #description, .description")
         desc = desc_el.get("content", "") if desc_el and desc_el.name == "meta" else (clean_html_description(str(desc_el)) if desc_el else "")
+        desc_source = "og:description" if desc_el and desc_el.name == "meta" else ("html" if desc_el else "not_found")
 
         # Price
         price_el = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount") or soup.select_one(".price, .product-price, [itemprop='price']")
         price = price_el.get("content", "") if price_el and price_el.name == "meta" else (price_el.get_text(strip=True) if price_el else "")
+        price_source = "product:price:amount" if price_el and price_el.name == "meta" and price_el.get("property") == "product:price:amount" else ("og:price:amount" if price_el and price_el.name == "meta" and price_el.get("property") == "og:price:amount" else ("html.price" if price_el else "not_found"))
 
         # Brand
         brand_el = soup.find("meta", property="product:brand") or soup.select_one(".brand, .vendor")
         brand = brand_el.get("content", "") if brand_el and brand_el.name == "meta" else (brand_el.get_text(strip=True) if brand_el else "")
+        brand_source = "product:brand" if brand_el and brand_el.name == "meta" else ("html.brand" if brand_el else "not_found")
 
         # Images
         img_els = soup.select(".product-gallery img, .product-images img, [data-main-image], .product-photo img")
@@ -369,6 +495,7 @@ class GenericAdapter(ProductAdapter):
                 imgs = [og_img["content"]]
 
         main_img, add_imgs, all_imgs = process_images(imgs, base_url=base_url)
+        image_source = "og:image" if not img_els and og_img else "html.product-gallery" if img_els else "not_found"
 
         # Specifications table
         specs = {}
@@ -380,6 +507,19 @@ class GenericAdapter(ProductAdapter):
                 if k and v:
                     specs[k] = v
 
+        # Check availability from stock indicators
+        stock_el = soup.select_one(".stock, .availability, [itemprop='availability'], .in-stock, .out-of-stock")
+        in_stock = True
+        if stock_el:
+            stock_text = stock_el.get_text(strip=True).lower()
+            stock_class = " ".join(stock_el.get("class", [])).lower()
+            if "out of stock" in stock_text or "outofstock" in stock_text or "out-of-stock" in stock_class:
+                in_stock = False
+
+        availability = "In Stock" if in_stock else "Out of Stock" if stock_el else ""
+        stock_status = availability
+        avail_source = "html.stock" if stock_el else "not_found"
+
         payload = {
             "source_url": base_url,
             "product_name": title,
@@ -389,49 +529,55 @@ class GenericAdapter(ProductAdapter):
             "vendor": brand,
             "product_url": base_url,
             "price": price,
-            "availability": "In Stock",
-            "stock_status": "In Stock",
+            "availability": availability,
+            "stock_status": stock_status,
             "main_image": main_img,
             "image_url": main_img,
             "additional_images": add_imgs,
             "all_images": all_imgs,
             "specifications": specs,
+            # Provenance
+            "price_source": price_source,
+            "title_source": title_source,
+            "image_source": image_source,
+            "sku_source": "not_found",
+            "description_source": desc_source,
+            "availability_source": avail_source,
+            "category_source": "not_found",
+            "variants_source": "not_found",
         }
         return normalize_universal_product(payload, source_url=base_url)
 
     def _discover_via_playwright(self, url: str, max_products: Optional[int] = None) -> List[Dict[str, Any]]:
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-                context = browser.new_context(user_agent=config.USER_AGENT, viewport={"width": 1920, "height": 1080})
-                page = context.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                page.evaluate("window.scrollBy(0, 1000)")
-                page.wait_for_timeout(2000)
-                content = page.content()
-                browser.close()
-
-                soup = BeautifulSoup(content, "html.parser")
-                return self._extract_html_product_cards(soup, url)
-        except Exception as e:
-            logger.warning(f"GenericAdapter Playwright discovery error: {e}")
-            return []
+        browser_config = BrowserConfig(timeout=45000)
+        
+        def extract(page):
+            page.evaluate("window.scrollBy(0, 1000)")
+            page.wait_for_timeout(2000)
+            content = page.content()
+            soup = BeautifulSoup(content, "html.parser")
+            return self._extract_html_product_cards(soup, url)
+        
+        result = extract_with_playwright(
+            url=url,
+            extract_fn=extract,
+            config=browser_config,
+            wait_until="domcontentloaded"
+        )
+        return result or []
 
     def _extract_via_playwright(self, url: str) -> Optional[Dict[str, Any]]:
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-                context = browser.new_context(user_agent=config.USER_AGENT, viewport={"width": 1920, "height": 1080})
-                page = context.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                page.wait_for_timeout(2000)
-                content = page.content()
-                browser.close()
-
-                soup = BeautifulSoup(content, "html.parser")
-                return self._extract_single_html(soup, url)
-        except Exception as e:
-            logger.warning(f"GenericAdapter Playwright single product error: {e}")
-            return None
+        browser_config = BrowserConfig(timeout=45000)
+        
+        def extract(page):
+            page.wait_for_timeout(2000)
+            content = page.content()
+            soup = BeautifulSoup(content, "html.parser")
+            return self._extract_single_html(soup, url)
+        
+        return extract_with_playwright(
+            url=url,
+            extract_fn=extract,
+            config=browser_config,
+            wait_until="domcontentloaded"
+        )

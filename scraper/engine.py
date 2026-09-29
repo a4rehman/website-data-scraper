@@ -1,5 +1,8 @@
 import time
 import threading
+import uuid
+import csv
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Callable
 from urllib.parse import urlparse
 from pathlib import Path
@@ -77,6 +80,7 @@ class UniversalScrapingEngine:
         csv_path: Optional[Path] = None,
         json_path: Optional[Path] = None,
         report_path: Optional[Path] = None,
+        job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes full extraction pipeline on a target URL with live progress tracking and exports.
@@ -107,9 +111,14 @@ class UniversalScrapingEngine:
                 "products": [],
             }
 
-        target_csv = csv_path or config.UNIVERSAL_CSV_PATH
-        target_json = json_path or config.UNIVERSAL_JSON_PATH
-        target_report = report_path or config.REPORT_TXT_PATH
+        # Generate job_id if not provided
+        if job_id is None:
+            job_id = uuid.uuid4().hex[:12]
+        
+        job_paths = config.get_job_paths(job_id)
+        target_csv = csv_path or job_paths["csv"]
+        target_json = json_path or job_paths["json"]
+        target_report = report_path or job_paths["report"]
         delay = request_delay if request_delay is not None else config.REQUEST_DELAY
 
         logger.info(f"=== Universal Scraping Engine Started for: {url} ===")
@@ -154,13 +163,15 @@ class UniversalScrapingEngine:
         scraped_products: List[Dict[str, Any]] = []
         scraped_keys = set()
         failed_count = 0
+        failed_products: List[Dict[str, Any]] = []
 
         if resume:
-            prog = load_progress()
+            prog = load_progress(job_paths["progress"])
             if prog.get("url") == url:
                 scraped_products = prog.get("scraped_products", [])
                 scraped_keys = set(prog.get("scraped_ids", []))
                 failed_count = prog.get("failed_count", 0)
+                failed_products = prog.get("failed_products", [])
                 logger.info(f"Resuming: Loaded {len(scraped_products)} previously saved items.")
 
         total_to_process = len(discovered_raw)
@@ -212,14 +223,45 @@ class UniversalScrapingEngine:
                     scraped_keys.add(item_key)
                 else:
                     failed_count += 1
+                    # Record failed product
+                    failed_products.append({
+                        "product_url": item.get("product_url") or item.get("url") or str(item),
+                        "reason": "Extraction returned None",
+                        "status_code": "",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "stage": "extraction",
+                    })
 
             except Exception as e:
                 logger.warning(f"Error extracting product [{item_key}]: {e}")
                 failed_count += 1
+                # Record failed product with error details
+                failed_products.append({
+                    "product_url": item.get("product_url") or item.get("url") or str(item),
+                    "reason": str(e),
+                    "status_code": "",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "stage": "extraction",
+                })
 
             # Save progress incrementally
             if idx % 5 == 0 or idx == total_to_process:
-                save_progress(list(scraped_keys), scraped_products, failed_count, source_url=url)
+                prog_data = {
+                    "url": url,
+                    "scraped_ids": list(scraped_keys),
+                    "scraped_products": scraped_products,
+                    "failed_count": failed_count,
+                    "failed_products": failed_products,
+                }
+                save_progress(list(scraped_keys), scraped_products, failed_count, source_url=url, filepath=job_paths["progress"])
+                # Also save failed products
+                try:
+                    with open(job_paths["failed"], "w", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=["product_url", "reason", "status_code", "timestamp", "stage"])
+                        writer.writeheader()
+                        writer.writerows(failed_products)
+                except Exception as e:
+                    logger.warning(f"Could not save failed products: {e}")
 
             # Polite rate limiting
             time.sleep(delay)
@@ -257,6 +299,17 @@ class UniversalScrapingEngine:
         export_to_csv(clean_products, target_csv)
         export_to_json(clean_products, target_json)
         generate_quality_report(stats, target_report, url=url)
+        
+        # Export failed products
+        if failed_products:
+            try:
+                with open(job_paths["failed"], "w", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=["product_url", "reason", "status_code", "timestamp", "stage"])
+                    writer.writeheader()
+                    writer.writerows(failed_products)
+                logger.info(f"Exported {len(failed_products)} failed products to {job_paths['failed']}")
+            except Exception as e:
+                logger.warning(f"Could not export failed products: {e}")
 
         if progress_callback:
             progress_callback({
@@ -270,6 +323,8 @@ class UniversalScrapingEngine:
 
         return {
             "success": True,
+            "job_id": job_id,
+            "job_paths": job_paths,
             "analysis": analysis,
             "stats": stats,
             "products": clean_products,
