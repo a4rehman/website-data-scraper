@@ -302,6 +302,21 @@ if stop_btn:
 st.markdown("---")
 st.subheader("📊 Live Status & Metrics")
 
+# Poll live_status.json for real progress when scraping is active
+if st.session_state.scraping_in_progress and st.session_state.current_job_id:
+    try:
+        job_paths = config.get_job_paths(st.session_state.current_job_id)
+        status_file = job_paths["job_dir"] / "live_status.json"
+        if status_file.exists():
+            with open(status_file, "r", encoding="utf-8") as f:
+                live_data = json.load(f)
+            st.session_state.current_status = live_data.get("status", st.session_state.current_status)
+            st.session_state.progress_count = live_data.get("progress_count", st.session_state.progress_count)
+            st.session_state.total_target = live_data.get("total_target", st.session_state.total_target)
+            st.session_state.current_product = live_data.get("current_product", st.session_state.current_product)
+    except Exception:
+        pass
+
 status_col1, status_col2 = st.columns([3, 1])
 with status_col1:
     if "❌" in st.session_state.current_status:
@@ -576,3 +591,11 @@ with d_col4:
         )
     else:
         st.button("📜 Download Logs", disabled=True, use_container_width=True)
+
+# ---------------------------------------------------------------------------
+# Auto-Refresh: Poll live_status.json every 2s while scraping is active
+# Placed at the very end so all UI elements render before the sleep/rerun cycle.
+# ---------------------------------------------------------------------------
+if st.session_state.scraping_in_progress:
+    time.sleep(2)
+    st.rerun()

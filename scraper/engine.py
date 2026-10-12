@@ -2,6 +2,7 @@ import time
 import threading
 import uuid
 import csv
+import json as json_module
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Callable
 from urllib.parse import urlparse
@@ -17,6 +18,17 @@ from scraper.exporter import (
     generate_quality_report
 )
 from scraper.utils import fetch_html, logger, validate_safe_url
+
+
+def _write_live_status(status_path: Path, data: Dict[str, Any]) -> None:
+    """Write live progress status to a JSON file for UI polling."""
+    try:
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(status_path, "w", encoding="utf-8") as f:
+            json_module.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.debug(f"Could not write live status: {e}")
+
 
 class UniversalScrapingEngine:
     """
@@ -129,13 +141,18 @@ class UniversalScrapingEngine:
         analysis = adapter.analyze_url(url, html=html_preview)
         logger.info(f"Adapter: {adapter.name} | Page Type: {analysis.get('page_type')}")
 
+        # Live status file for UI polling (separate from resume progress)
+        status_path = job_paths["job_dir"] / "live_status.json"
+
         if progress_callback:
-            progress_callback({
+            status_data = {
                 "status": f"🔍 Discovered platform: {adapter.name} ({analysis.get('page_type')}). Discovering products...",
                 "progress_count": 0,
                 "total_target": 0,
                 "current_product": "Analyzing...",
-            })
+            }
+            progress_callback(status_data)
+            _write_live_status(status_path, status_data)
 
         # 2. Product Discovery
         discovered_raw = adapter.discover_products(
@@ -146,6 +163,17 @@ class UniversalScrapingEngine:
         total_discovered = len(discovered_raw)
         logger.info(f"Total items discovered: {total_discovered}")
 
+        # Notify UI of discovery results so progress bar becomes determinate
+        if progress_callback:
+            status_data = {
+                "status": f"✅ Discovery complete: {total_discovered} items found. Starting extraction...",
+                "progress_count": 0,
+                "total_target": total_discovered,
+                "current_product": "",
+            }
+            progress_callback(status_data)
+            _write_live_status(status_path, status_data)
+
         if not discovered_raw:
             return {
                 "success": False,
@@ -154,6 +182,7 @@ class UniversalScrapingEngine:
                 "stats": {"discovered": 0, "scraped": 0, "failed": 0, "duplicates_removed": 0},
                 "products": [],
             }
+
 
         # Apply max_products ceiling
         if max_products and total_discovered > max_products:
@@ -191,12 +220,14 @@ class UniversalScrapingEngine:
             current_name = item.get("product_name") or item.get("title") or item_key if isinstance(item, dict) else item_key
 
             if progress_callback:
-                progress_callback({
+                status_data = {
                     "status": f"Extracting [{idx}/{total_to_process}]: {str(current_name)[:50]}",
                     "progress_count": len(scraped_products),
                     "total_target": total_to_process,
                     "current_product": str(current_name)[:80],
-                })
+                }
+                progress_callback(status_data)
+                _write_live_status(status_path, status_data)
 
             try:
                 extracted = adapter.extract_product(
@@ -312,12 +343,14 @@ class UniversalScrapingEngine:
                 logger.warning(f"Could not export failed products: {e}")
 
         if progress_callback:
-            progress_callback({
+            status_data = {
                 "status": f"✅ Complete! Extracted {len(clean_products)} products.",
                 "progress_count": len(clean_products),
                 "total_target": total_to_process,
                 "current_product": "Done",
-            })
+            }
+            progress_callback(status_data)
+            _write_live_status(status_path, status_data)
 
         logger.info(f"=== Extraction Completed: {len(clean_products)} saved to {target_csv} ===")
 
