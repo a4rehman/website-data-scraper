@@ -21,9 +21,10 @@ data/products.csv
 data/products.json
 data/products_raw.csv
 data/products_clean.csv
-data/tehzeeb_libas_products.csv
+data/tehzee_libas_products.csv
 data/progress.json
 data/scrape_report.txt
+data/jobs/
 logs/scraper.log
 logs/failed_products.csv
 

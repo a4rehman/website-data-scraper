@@ -1,8 +1,11 @@
 import ipaddress
+import json
 import logging
+import re
 import socket
 import time
 import os
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
 import requests
@@ -165,157 +168,284 @@ def validate_redirect_url(original_url: str, redirect_url: str) -> Tuple[bool, s
     
     return True, ""
 
+def log_fetch_event(
+    stage: str,
+    url: str,
+    status: Optional[int] = None,
+    error: Optional[BaseException] = None,
+    detail: str = "",
+) -> None:
+    """
+    Structured diagnostic logging for fetch pipeline stages.
+    Never logs headers, cookies, or secrets.
+    """
+    parts = [f"stage={stage}", f"url={url}"]
+    if status is not None:
+        parts.append(f"http_status={status}")
+    if error is not None:
+        parts.append(f"error_type={type(error).__name__}")
+        parts.append(f"error={error}")
+    if detail:
+        parts.append(f"detail={detail}")
+    logger.info("FETCH_EVENT " + " | ".join(parts))
+
+
+@dataclass
+class FetchResult:
+    """Result of a single successful HTTP fetch with the body read exactly once."""
+    status_code: int
+    content: bytes
+    headers: Dict[str, str] = field(default_factory=dict)
+    final_url: str = ""
+    encoding: str = "utf-8"
+
+    def text(self) -> str:
+        return self.content.decode(self.encoding, errors="replace")
+
+
+def _charset_from_headers(headers: Dict[str, str]) -> Optional[str]:
+    """Extract charset from a Content-Type header value, if present."""
+    content_type = ""
+    for k, v in headers.items():
+        if k.lower() == "content-type":
+            content_type = v
+            break
+    if not content_type:
+        return None
+    m = re.search(r"charset=([^\s;]+)", content_type, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip("\"'").lower()
+    return None
+
+
+def _decode_bytes(content: bytes, headers: Dict[str, str]) -> str:
+    """
+    Decode raw bytes to text exactly once.
+    Uses the charset from the Content-Type header when present,
+    otherwise tries UTF-8 (with BOM handling) and falls back safely.
+    """
+    if content.startswith(b"\xef\xbb\xbf"):
+        return content.decode("utf-8-sig", errors="replace")
+    charset = _charset_from_headers(headers)
+    if charset:
+        try:
+            return content.decode(charset, errors="replace")
+        except LookupError:
+            pass
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content.decode("utf-8", errors="replace")
+
+
+def _read_response_bytes(response: "requests.Response", max_size: int) -> Tuple[Optional[bytes], str]:
+    """
+    Reads a streamed response body exactly once into memory, enforcing max_size.
+    Returns (content_bytes, error_reason). content_bytes is None on error.
+    The response is closed by the caller (or via context manager upstream).
+    """
+    content_length = response.headers.get("Content-Length")
+    if content_length:
+        try:
+            if int(content_length) > max_size:
+                return None, f"content_length {content_length} exceeds limit {max_size}"
+        except ValueError:
+            pass  # Non-numeric Content-Length; rely on streamed limit below.
+
+    chunks = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=8192):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_size:
+            return None, f"streamed body exceeds limit {max_size}"
+        chunks.append(chunk)
+    return b"".join(chunks), ""
+
+
+def _fetch_once(
+    url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    verify: bool = True,
+    max_size: int = MAX_RESPONSE_SIZE,
+) -> Tuple[Optional[FetchResult], str]:
+    """
+    Performs a single streamed GET, reading the response body exactly once.
+    Never calls response.text / response.json after iter_content.
+    Returns (FetchResult, "") on success or (None, error_reason) on failure.
+    """
+    try:
+        with requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=config.TIMEOUT,
+            verify=verify,
+            stream=True,
+            allow_redirects=True,
+        ) as response:
+            status = response.status_code
+            final_url = str(getattr(response, "url", "") or url)
+            resp_headers = dict(response.headers)
+
+            if status == 429:
+                return None, "http_429"
+            if status >= 500:
+                return None, f"http_{status}"
+            if status >= 400:
+                # Client errors (403, 404, etc.) are not retryable success paths.
+                return None, f"client_error_{status}"
+
+            content, size_err = _read_response_bytes(response, max_size)
+            if content is None:
+                log_fetch_event("read_body", url, status=status, detail=size_err)
+                return None, size_err
+
+            encoding = _charset_from_headers(resp_headers) or "utf-8"
+            return FetchResult(
+                status_code=status,
+                content=content,
+                headers=resp_headers,
+                final_url=final_url,
+                encoding=encoding,
+            ), ""
+    except requests.exceptions.Timeout as e:
+        return None, f"timeout:{e}"
+    except requests.exceptions.SSLError as e:
+        return None, f"ssl:{e}"
+    except requests.exceptions.ConnectionError as e:
+        return None, f"connection:{e}"
+    except requests.exceptions.RequestException as e:
+        return None, f"request_error:{e}"
+    except Exception as e:  # noqa: BLE001 - diagnostics must never crash the caller
+        return None, f"unexpected:{type(e).__name__}:{e}"
+
+
+def _fetch_with_retries(
+    url: str,
+    *,
+    kind: str,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    max_size: int,
+) -> Optional[FetchResult]:
+    """
+    Shared retry loop for HTML and JSON fetches.
+    Reads each attempt's body exactly once; retries create fresh requests.
+    SSL verification stays enabled unless ALLOW_INSECURE_SSL=true.
+    """
+    allow_insecure = os.getenv("ALLOW_INSECURE_SSL", "false").lower() == "true"
+    last_reason = ""
+
+    for attempt in range(1, config.MAX_RETRIES + 1):
+        if attempt > 1:
+            time.sleep(config.REQUEST_DELAY * attempt)
+        else:
+            time.sleep(config.REQUEST_DELAY)
+
+        result, reason = _fetch_once(
+            url, params=params, headers=headers, verify=not allow_insecure, max_size=max_size
+        )
+        if result is not None:
+            if result.final_url and result.final_url != url:
+                log_fetch_event(kind, url, status=result.status_code, detail=f"redirected_to={result.final_url}")
+            else:
+                log_fetch_event(kind, url, status=result.status_code)
+            return result
+
+        last_reason = reason
+        log_fetch_event(kind, url, error=None, detail=f"attempt={attempt}/{config.MAX_RETRIES} reason={reason}")
+
+        if reason.startswith("client_error_") or reason.startswith(("content_length", "streamed body")):
+            # Hard failures: do not retry (oversized bodies and 4xx won't change).
+            break
+
+        if reason == "http_429":
+            time.sleep(config.REQUEST_DELAY * (2 ** attempt))
+            continue
+
+        if reason.startswith("ssl:"):
+            if allow_insecure:
+                logger.warning(f"ALLOW_INSECURE_SSL=true set, retrying {url} without certificate verification...")
+                result, insecure_reason = _fetch_once(
+                    url, params=params, headers=headers, verify=False, max_size=max_size
+                )
+                if result is not None:
+                    log_fetch_event(kind, url, status=result.status_code, detail="insecure_ssl_fallback")
+                    return result
+                last_reason = insecure_reason
+            else:
+                logger.error(
+                    f"SSL verification failed for {url}. Certificate verification stays enabled; "
+                    "set ALLOW_INSECURE_SSL=true to bypass (not recommended)."
+                )
+            break
+
+    log_fetch_event(kind, url, error=None, detail=f"GIVING_UP reason={last_reason}")
+    return None
+
+
 def fetch_json(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """
-    Fetches JSON content from a URL with retry logic, SSRF checks, and exponential backoff.
-    SSL verification is always enforced. Set ALLOW_INSECURE_SSL=true to disable (not recommended).
+    Fetches JSON content from a URL with retry logic, SSRF checks, and size limits.
+    The response body is read exactly once; JSON is parsed from those bytes.
+    SSL verification is enforced by default.
     """
     is_safe, reason = validate_safe_url(url)
     if not is_safe:
         logger.warning(f"Blocked JSON fetch for security/validation: {reason}")
         return None
 
-    allow_insecure = os.getenv("ALLOW_INSECURE_SSL", "false").lower() == "true"
-    
-    headers = {"User-Agent": config.USER_AGENT}
-    for attempt in range(1, config.MAX_RETRIES + 1):
-        try:
-            time.sleep(config.REQUEST_DELAY)
-            response = requests.get(url, params=params, headers=headers, timeout=config.TIMEOUT, verify=not allow_insecure, stream=True)
-            
-            # Check response size before reading
-            content_length = response.headers.get("Content-Length")
-            if content_length and int(content_length) > MAX_JSON_SIZE:
-                logger.warning(f"Response size {content_length} exceeds MAX_JSON_SIZE ({MAX_JSON_SIZE}) for {url}")
-                response.close()
-                return None
-            
-            # Read with size limit
-            content = b""
-            for chunk in response.iter_content(chunk_size=8192):
-                content += chunk
-                if len(content) > MAX_JSON_SIZE:
-                    logger.warning(f"Response size exceeds MAX_JSON_SIZE ({MAX_JSON_SIZE}) for {url}")
-                    response.close()
-                    return None
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
-                wait_time = config.REQUEST_DELAY * (2 ** attempt)
-                logger.warning(f"Rate limited (429). Retrying in {wait_time:.1f}s for {url}")
-                time.sleep(wait_time)
-            else:
-                logger.warning(f"HTTP {response.status_code} on attempt {attempt} for {url}")
-        except requests.exceptions.SSLError as e:
-            logger.warning(f"SSL certificate verification failed for {url}: {e}")
-            if allow_insecure:
-                logger.warning("ALLOW_INSECURE_SSL=true set, retrying without verification...")
-                try:
-                    response = requests.get(url, params=params, headers=headers, timeout=config.TIMEOUT, verify=False, stream=True)
-                    content = b""
-                    for chunk in response.iter_content(chunk_size=8192):
-                        content += chunk
-                        if len(content) > MAX_JSON_SIZE:
-                            logger.warning(f"Response size exceeds MAX_JSON_SIZE ({MAX_JSON_SIZE}) for {url}")
-                            response.close()
-                            return None
-                    if response.status_code == 200:
-                        return response.json()
-                except Exception as ssl_err:
-                    logger.error(f"SSL fallback failed for {url}: {ssl_err}")
-                    break
-            else:
-                logger.error("SSL verification failed. Set ALLOW_INSECURE_SSL=true to bypass (not recommended for production).")
-                break
-        except requests.exceptions.Timeout:
-            logger.warning(f"Request timeout ({config.TIMEOUT}s) on attempt {attempt}/{config.MAX_RETRIES} for {url}")
-            time.sleep(config.REQUEST_DELAY * attempt)
-        except requests.exceptions.ConnectionError as e:
-            logger.warning(f"Connection error for {url}: {e}")
-            time.sleep(config.REQUEST_DELAY * attempt)
-        except Exception as e:
-            logger.warning(f"Fetch error on attempt {attempt}/{config.MAX_RETRIES} for {url}: {e}")
-            time.sleep(config.REQUEST_DELAY * attempt)
+    headers = {"User-Agent": config.USER_AGENT, "Accept": "application/json,text/plain,*/*"}
+    result = _fetch_with_retries(url, kind="fetch_json", params=params, headers=headers, max_size=MAX_JSON_SIZE)
+    if result is None:
+        return None
 
-    logger.error(f"Failed to fetch JSON after {config.MAX_RETRIES} attempts: {url}")
-    return None
+    if not result.content:
+        logger.warning(f"Empty JSON body from {url}")
+        return None
+
+    try:
+        parsed = json.loads(result.content.decode("utf-8-sig", errors="strict"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        log_fetch_event("parse_json", url, status=result.status_code, error=e)
+        return None
+
+    if isinstance(parsed, dict):
+        return parsed
+    # Some public APIs return top-level lists; wrap for callers expecting a dict.
+    return {"items": parsed}
+
 
 def fetch_html(url: str) -> Optional[str]:
     """
-    Fetches HTML content from a URL with retry logic and SSRF validation.
-    SSL verification is always enforced. Set ALLOW_INSECURE_SSL=true to disable (not recommended).
+    Fetches HTML content from a URL with retry logic, SSRF validation, and size limits.
+    The response body is read exactly once and decoded from those same bytes
+    (never response.text after iter_content). SSL verification is enforced by default.
     """
     is_safe, reason = validate_safe_url(url)
     if not is_safe:
         logger.warning(f"Blocked HTML fetch for security/validation: {reason}")
         return None
 
-    allow_insecure = os.getenv("ALLOW_INSECURE_SSL", "false").lower() == "true"
-    
     headers = {
         "User-Agent": config.USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    for attempt in range(1, config.MAX_RETRIES + 1):
-        try:
-            time.sleep(config.REQUEST_DELAY)
-            response = requests.get(url, headers=headers, timeout=config.TIMEOUT, verify=not allow_insecure, stream=True)
-            
-            # Check response size before reading
-            content_length = response.headers.get("Content-Length")
-            if content_length and int(content_length) > MAX_HTML_SIZE:
-                logger.warning(f"Response size {content_length} exceeds MAX_HTML_SIZE ({MAX_HTML_SIZE}) for {url}")
-                response.close()
-                return None
-            
-            # Read with size limit
-            content = b""
-            for chunk in response.iter_content(chunk_size=8192):
-                content += chunk
-                if len(content) > MAX_HTML_SIZE:
-                    logger.warning(f"Response size exceeds MAX_HTML_SIZE ({MAX_HTML_SIZE}) for {url}")
-                    response.close()
-                    return None
-            
-            if response.status_code == 200:
-                # Force UTF-8 if encoding is ambiguous
-                if response.encoding is None or response.encoding == "ISO-8859-1":
-                    response.encoding = response.apparent_encoding or "utf-8"
-                return response.text
-            else:
-                logger.warning(f"HTTP {response.status_code} on attempt {attempt} for {url}")
-        except requests.exceptions.SSLError as e:
-            logger.warning(f"SSL certificate verification failed for {url}: {e}")
-            if allow_insecure:
-                logger.warning("ALLOW_INSECURE_SSL=true set, retrying without verification...")
-                try:
-                    response = requests.get(url, headers=headers, timeout=config.TIMEOUT, verify=False, stream=True)
-                    content = b""
-                    for chunk in response.iter_content(chunk_size=8192):
-                        content += chunk
-                        if len(content) > MAX_HTML_SIZE:
-                            logger.warning(f"Response size exceeds MAX_HTML_SIZE ({MAX_HTML_SIZE}) for {url}")
-                            response.close()
-                            return None
-                    if response.status_code == 200:
-                        return response.text
-                except Exception as ssl_err:
-                    logger.error(f"SSL fallback failed for {url}: {ssl_err}")
-                    break
-            else:
-                logger.error("SSL verification failed. Set ALLOW_INSECURE_SSL=true to bypass (not recommended for production).")
-                break
-        except requests.exceptions.Timeout:
-            logger.warning(f"Request timeout on attempt {attempt}/{config.MAX_RETRIES} for {url}")
-            time.sleep(config.REQUEST_DELAY * attempt)
-        except requests.exceptions.ConnectionError as e:
-            logger.warning(f"Connection error for {url}: {e}")
-            time.sleep(config.REQUEST_DELAY * attempt)
-        except Exception as e:
-            logger.warning(f"Fetch error on attempt {attempt}/{config.MAX_RETRIES} for {url}: {e}")
-            time.sleep(config.REQUEST_DELAY * attempt)
+    result = _fetch_with_retries(url, kind="fetch_html", headers=headers, max_size=MAX_HTML_SIZE)
+    if result is None:
+        return None
 
-    logger.error(f"Failed to fetch HTML after {config.MAX_RETRIES} attempts: {url}")
-    return None
+    if not result.content:
+        logger.warning(f"Empty HTML body from {url}")
+        return None
+
+    text = _decode_bytes(result.content, result.headers)
+    if not text.strip():
+        logger.warning(f"HTML body from {url} decoded to whitespace only")
+        return None
+    return text

@@ -18,6 +18,20 @@ from scraper.exporter import (
 )
 from scraper.ai_processor import summarize_scraped_data_with_ai
 from scraper.utils import logger, validate_safe_url
+from scraper.job_store import (
+    JobStatusStore,
+    STATE_QUEUED,
+    STATE_FETCHING,
+    STATE_DISCOVERING,
+    STATE_EXTRACTING,
+    STATE_EXPORTING,
+    STATE_COMPLETED,
+    STATE_COMPLETED_WITH_ERRORS,
+    STATE_CANCELLED,
+    STATE_FAILED,
+    TERMINAL_STATES,
+)
+from scraper.browser_manager import check_browser_available
 
 # Set page layout and config
 st.set_page_config(
@@ -65,19 +79,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize Session State (Phase 10)
-if "scraping_in_progress" not in st.session_state:
-    st.session_state.scraping_in_progress = False
-if "current_status" not in st.session_state:
-    st.session_state.current_status = "Idle"
-if "current_product" not in st.session_state:
-    st.session_state.current_product = ""
-if "progress_count" not in st.session_state:
-    st.session_state.progress_count = 0
-if "total_target" not in st.session_state:
-    st.session_state.total_target = 0
-if "stop_requested" not in st.session_state:
-    st.session_state.stop_requested = False
+# Initialize Session State.
+# IMPORTANT: background worker threads must NEVER write st.session_state directly
+# (it is not thread-safe). Workers publish status to JobStatusStore instead;
+# the UI polls the store on each rerun.
+if "active_job_id" not in st.session_state:
+    st.session_state.active_job_id = None
 if "url_analysis" not in st.session_state:
     st.session_state.url_analysis = None
 if "last_url" not in st.session_state:
@@ -86,12 +93,10 @@ if "last_scrape_results" not in st.session_state:
     st.session_state.last_scrape_results = None
 if "ai_summary_result" not in st.session_state:
     st.session_state.ai_summary_result = None
-if "current_job_id" not in st.session_state:
-    st.session_state.current_job_id = None
 if "current_job_paths" not in st.session_state:
     st.session_state.current_job_paths = None
-
-stop_event = threading.Event()
+if "preset_url" not in st.session_state:
+    st.session_state.preset_url = ""
 
 # Title Header
 st.markdown('<div class="main-header">Universal E-Commerce Product Scraper</div>', unsafe_allow_html=True)
@@ -120,11 +125,27 @@ request_delay_val = st.sidebar.slider(
     help="Polite rate limiting delay between consecutive requests"
 )
 
-use_browser_val = st.sidebar.toggle(
-    "Use Headless Browser (Playwright)",
-    value=True,
-    help="Required for dynamic JavaScript SPAs (e.g. Temu, Shein, React/Vue storefronts)"
-)
+# Browser availability health check (cached per process; explicit diagnostic)
+browser_diag = check_browser_available()
+if browser_diag.get("available"):
+    use_browser_val = st.sidebar.toggle(
+        "Use Headless Browser (Playwright)",
+        value=True,
+        help="Required for dynamic JavaScript SPAs (e.g. Temu, Shein, React/Vue storefronts)"
+    )
+    st.sidebar.caption("✅ Chromium available")
+else:
+    st.sidebar.toggle(
+        "Use Headless Browser (Playwright)",
+        value=False,
+        disabled=True,
+        help="Browser unavailable — see diagnostic below",
+    )
+    use_browser_val = False
+    st.sidebar.warning(
+        f"⚠️ Headless browser unavailable: {browser_diag.get('message', 'Chromium not installed')}"
+        " Static HTML/JSON extraction will still run."
+    )
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Fields & Feature Toggles")
@@ -165,16 +186,22 @@ if url_input != st.session_state.last_url:
     st.session_state.url_analysis = None
     st.session_state.ai_summary_result = None
 
+# Detect whether the active job is still running by polling the job store
+# (never rely on a worker thread flipping a session-state flag).
+active_job_id = st.session_state.get("active_job_id")
+active_status: Dict[str, Any] = JobStatusStore.get(active_job_id) if active_job_id else {}
+scraping_in_progress = bool(active_job_id) and not JobStatusStore.is_terminal(active_job_id)
+
 col_act1, col_act2, col_act3 = st.columns([2, 2, 3])
 
 with col_act1:
-    analyze_btn = st.button("🔍 Analyze URL", use_container_width=True, disabled=st.session_state.scraping_in_progress)
+    analyze_btn = st.button("🔍 Analyze URL", use_container_width=True, disabled=scraping_in_progress)
 
 with col_act2:
-    start_btn = st.button("🚀 Start Extraction", use_container_width=True, disabled=st.session_state.scraping_in_progress or not url_input.strip())
+    start_btn = st.button("🚀 Start Extraction", use_container_width=True, disabled=scraping_in_progress or not url_input.strip())
 
 with col_act3:
-    stop_btn = st.button("⏸ Stop / Cancel", use_container_width=True, disabled=not st.session_state.scraping_in_progress)
+    stop_btn = st.button("⏸ Stop / Cancel", use_container_width=True, disabled=not scraping_in_progress)
 
 # URL Analysis Execution (Phase 2, 5, 12)
 if analyze_btn:
@@ -220,17 +247,19 @@ if st.session_state.url_analysis:
 # Background Scraping Task Runner
 # ---------------------------------------------------------------------------
 def run_scrape_worker(target_url, max_p, delay, browser, imgs, vars_flag, descs, resume_flag, job_id):
+    """
+    Runs the scraping engine in a daemon thread.
+    Publishes ALL status updates to the thread-safe JobStatusStore —
+    never touches st.session_state (which is not thread-safe).
+    """
     engine = UniversalScrapingEngine()
 
     def update_progress(data: Dict[str, Any]):
-        st.session_state.current_status = data.get("status", "")
-        st.session_state.progress_count = data.get("progress_count", 0)
-        st.session_state.total_target = data.get("total_target", 0)
-        st.session_state.current_product = data.get("current_product", "")
+        # The engine already writes to the job store; this callback keeps
+        # legacy progress_callback contract working for callers that log.
+        JobStatusStore.append_log(job_id, f"{data.get('state', '')}: {data.get('status', '')}")
 
-    st.session_state.scraping_in_progress = True
-    st.session_state.current_status = "Starting extraction..."
-    stop_event.clear()
+    JobStatusStore.update(job_id, state=STATE_QUEUED, status="Queued — starting worker thread...")
 
     try:
         results = engine.scrape_url(
@@ -243,35 +272,44 @@ def run_scrape_worker(target_url, max_p, delay, browser, imgs, vars_flag, descs,
             extract_descriptions=descs,
             resume=resume_flag,
             progress_callback=update_progress,
-            stop_event=stop_event,
+            stop_event=JobStatusStore.cancel_event(job_id),
             job_id=job_id
         )
-        st.session_state.last_scrape_results = results
-        if results.get("success"):
-            st.session_state.current_status = f"✅ Completed! Extracted {len(results.get('products', []))} products."
-            st.session_state.current_job_id = results.get("job_id")
-            st.session_state.current_job_paths = results.get("job_paths")
-        else:
-            st.session_state.current_status = f"⚠️ {results.get('message', 'Extraction ended.')}"
+        # The engine sets a terminal state; stash paths/results for the UI
+        # via the job store so the next rerun can pick them up.
+        JobStatusStore.update(
+            job_id,
+            result_success=bool(results.get("success")),
+            result_message=results.get("message", ""),
+            job_paths=results.get("job_paths"),
+            stats=results.get("stats", {}),
+        )
+        if results.get("job_paths"):
+            JobStatusStore.update(job_id, job_paths=results["job_paths"])
     except Exception as e:
-        logger.error(f"Scraping thread error: {e}")
-        st.session_state.current_status = f"❌ Error: {e}"
-    finally:
-        st.session_state.scraping_in_progress = False
+        logger.error(f"Scraping thread error: {type(e).__name__}: {e}")
+        JobStatusStore.update(
+            job_id,
+            state=STATE_FAILED,
+            status=f"Failed: {type(e).__name__}: {e}",
+            error=str(e),
+        )
 
 if start_btn:
     cleaned_url = url_input.strip()
-    if cleaned_url and not st.session_state.scraping_in_progress:
+    if cleaned_url and not scraping_in_progress:
         is_safe, reason = validate_safe_url(cleaned_url)
         if not is_safe:
             st.error(f"⚠️ Access Blocked: {reason}")
         else:
-            # Generate new job ID for this scrape
+            # Generate new job ID for this scrape — isolates all state from
+            # any previous job, preventing stale status bleed-over.
             job_id = uuid.uuid4().hex[:12]
-            st.session_state.progress_count = 0
-            st.session_state.total_target = 0
             st.session_state.ai_summary_result = None
-            st.session_state.current_job_id = job_id
+            st.session_state.last_scrape_results = None
+            st.session_state.active_job_id = job_id
+            JobStatusStore.create_job(job_id, url=cleaned_url)
+            JobStatusStore.update(job_id, state=STATE_QUEUED, status="Queued — preparing scrape...")
 
             worker_thread = threading.Thread(
                 target=run_scrape_worker,
@@ -291,10 +329,9 @@ if start_btn:
             worker_thread.start()
             st.rerun()
 
-if stop_btn:
-    stop_event.set()
-    st.session_state.stop_requested = True
-    st.warning("Stop requested. Halting scraper gracefully...")
+if stop_btn and active_job_id:
+    JobStatusStore.request_cancel(active_job_id)
+    st.warning("Stop requested. Finishing current item and preserving partial results...")
 
 # ---------------------------------------------------------------------------
 # Live Status & Metrics Section
@@ -302,75 +339,113 @@ if stop_btn:
 st.markdown("---")
 st.subheader("📊 Live Status & Metrics")
 
-# Poll live_status.json for real progress when scraping is active
-if st.session_state.scraping_in_progress and st.session_state.current_job_id:
-    try:
-        job_paths = config.get_job_paths(st.session_state.current_job_id)
-        status_file = job_paths["job_dir"] / "live_status.json"
-        if status_file.exists():
-            with open(status_file, "r", encoding="utf-8") as f:
-                live_data = json.load(f)
-            st.session_state.current_status = live_data.get("status", st.session_state.current_status)
-            st.session_state.progress_count = live_data.get("progress_count", st.session_state.progress_count)
-            st.session_state.total_target = live_data.get("total_target", st.session_state.total_target)
-            st.session_state.current_product = live_data.get("current_product", st.session_state.current_product)
-    except Exception:
-        pass
+# Poll the thread-safe job store for the active job's live status.
+status = active_status if active_job_id else {}
+state = status.get("state", STATE_QUEUED if not active_job_id else "")
+status_text = status.get("status", "Idle" if not active_job_id else "Queued")
+current_product = status.get("current_product", "")
+progress_count = status.get("progress_count", 0)
+total_target = status.get("total_target", 0)
+extracted_count = status.get("extracted", 0)
+failed_count = status.get("failed", 0)
+duplicates_count = status.get("duplicates", 0)
+discovered_count = status.get("discovered", 0)
+elapsed = status.get("elapsed_seconds", 0.0)
+job_error = status.get("error", "")
+job_paths = status.get("job_paths") or st.session_state.get("current_job_paths")
+
+# Keep session paths in sync for the preview/export tabs
+if job_paths and job_paths != st.session_state.get("current_job_paths"):
+    st.session_state.current_job_paths = job_paths
 
 status_col1, status_col2 = st.columns([3, 1])
 with status_col1:
-    if "❌" in st.session_state.current_status:
-        st.error(f"**Status:** {st.session_state.current_status}")
-    elif "⚠️" in st.session_state.current_status:
-        st.warning(f"**Status:** {st.session_state.current_status}")
+    if state == STATE_FAILED or job_error:
+        st.error(f"**Status [{state or 'Failed'}]:** {status_text}")
+    elif state == STATE_CANCELLED:
+        st.warning(f"**Status [Cancelled]:** {status_text}")
+    elif state == STATE_COMPLETED_WITH_ERRORS:
+        st.warning(f"**Status [Completed with errors]:** {status_text}")
+    elif state in (STATE_COMPLETED,):
+        st.success(f"**Status [Completed]:** {status_text}")
+    elif active_job_id and not JobStatusStore.is_terminal(active_job_id):
+        st.info(f"**Status [{state or 'Queued'}]:** {status_text}")
     else:
-        st.info(f"**Status:** {st.session_state.current_status}")
+        st.info(f"**Status:** {status_text if active_job_id else 'Idle — awaiting a scrape'}")
 
 with status_col2:
-    if st.session_state.scraping_in_progress:
+    if active_job_id and not JobStatusStore.is_terminal(active_job_id):
         st.warning("⚡ Scraping active...")
     else:
         st.success("✅ System ready")
 
-if st.session_state.scraping_in_progress or st.session_state.progress_count > 0:
-    total = st.session_state.total_target if st.session_state.total_target > 0 else 1
-    pct = min(st.session_state.progress_count / total, 1.0)
-    st.progress(pct)
-    st.caption(f"Current Item: **{st.session_state.current_product}** | Processed: **{st.session_state.progress_count} / {st.session_state.total_target}** ({int(pct*100)}%)")
+# Progress display: indeterminate during discovery (total unknown),
+# determinate once the total is known.
+if active_job_id and not JobStatusStore.is_terminal(active_job_id):
+    if state in (STATE_DISCOVERING, STATE_FETCHING, STATE_QUEUED) or total_target == 0:
+        st.progress(0.0, text="Discovering products… (total unknown — indeterminate)")
+    else:
+        total = total_target if total_target > 0 else 1
+        pct = min(progress_count / total, 1.0)
+        st.progress(pct, text=f"{int(pct * 100)}% — {progress_count} / {total_target}")
+    st.caption(
+        f"Current: **{current_product or '—'}** | "
+        f"Processed: **{progress_count} / {total_target or '?'}** | "
+        f"Extracted: **{extracted_count}** | "
+        f"Failed: **{failed_count}** | "
+        f"Duplicates: **{duplicates_count}** | "
+        f"Elapsed: **{elapsed:.1f}s**"
+    )
+elif active_job_id and JobStatusStore.is_terminal(active_job_id) and (extracted_count or failed_count or discovered_count):
+    # Post-completion summary line
+    st.caption(
+        f"Final — Discovered: **{discovered_count}** | Extracted: **{extracted_count}** | "
+        f"Failed: **{failed_count}** | Duplicates: **{duplicates_count}** | "
+        f"Elapsed: **{elapsed:.1f}s**"
+    )
 
-# Calculate metrics from final files if present
-discovered_val = 0
-scraped_val = 0
-failed_val = 0
-dupes_val = 0
+# Calculate metrics from job store stats (preferred) or report file fallback
+discovered_val = discovered_count
+scraped_val = extracted_count
+failed_val = failed_count
+dupes_val = duplicates_count
 missing_price_val = 0
 missing_img_val = 0
 
-# Use job-specific paths if available, otherwise fall back to defaults
-report_path = None
-if st.session_state.current_job_paths and "report" in st.session_state.current_job_paths:
-    report_path = st.session_state.current_job_paths["report"]
-elif config.REPORT_TXT_PATH.exists():
-    report_path = config.REPORT_TXT_PATH
+if active_job_id and status.get("stats"):
+    s = status["stats"]
+    discovered_val = s.get("discovered", discovered_val)
+    scraped_val = s.get("scraped", scraped_val)
+    failed_val = s.get("failed", failed_val)
+    dupes_val = s.get("duplicates_removed", dupes_val)
+    missing_price_val = s.get("missing_price", 0)
+    missing_img_val = s.get("missing_image", 0)
+else:
+    # Use job-specific paths if available, otherwise fall back to defaults
+    report_path = None
+    if job_paths and "report" in job_paths:
+        report_path = job_paths["report"]
+    elif config.REPORT_TXT_PATH.exists():
+        report_path = config.REPORT_TXT_PATH
 
-if report_path and report_path.exists():
-    try:
-        report_text = report_path.read_text(encoding="utf-8")
-        for line in report_text.splitlines():
-            if "Total Products Discovered:" in line:
-                discovered_val = int(line.split(":")[-1].strip())
-            elif "Total Products Extracted:" in line or "Total Products Scraped:" in line:
-                scraped_val = int(line.split(":")[-1].strip())
-            elif "Total Failed" in line:
-                failed_val = int(line.split(":")[-1].strip())
-            elif "Duplicates Removed:" in line:
-                dupes_val = int(line.split(":")[-1].strip())
-            elif "Products Missing Price:" in line:
-                missing_price_val = int(line.split(":")[-1].strip())
-            elif "Products Missing Image:" in line:
-                missing_img_val = int(line.split(":")[-1].strip())
-    except Exception:
-        pass
+    if report_path and report_path.exists():
+        try:
+            report_text = report_path.read_text(encoding="utf-8")
+            for line in report_text.splitlines():
+                if "Total Products Discovered:" in line:
+                    discovered_val = int(line.split(":")[-1].strip())
+                elif "Total Products Extracted:" in line or "Total Products Scraped:" in line:
+                    scraped_val = int(line.split(":")[-1].strip())
+                elif "Total Failed" in line:
+                    failed_val = int(line.split(":")[-1].strip())
+                elif "Duplicates Removed:" in line:
+                    dupes_val = int(line.split(":")[-1].strip())
+                elif "Products Missing Price:" in line:
+                    missing_price_val = int(line.split(":")[-1].strip())
+                elif "Products Missing Image:" in line:
+                    missing_img_val = int(line.split(":")[-1].strip())
+        except Exception:
+            pass
 
 m_col1, m_col2, m_col3, m_col4, m_col5, m_col6 = st.columns(6)
 m_col1.metric("Discovered", discovered_val)
@@ -593,9 +668,9 @@ with d_col4:
         st.button("📜 Download Logs", disabled=True, use_container_width=True)
 
 # ---------------------------------------------------------------------------
-# Auto-Refresh: Poll live_status.json every 2s while scraping is active
+# Auto-Refresh: poll the job store every 2s while the active job is non-terminal.
 # Placed at the very end so all UI elements render before the sleep/rerun cycle.
 # ---------------------------------------------------------------------------
-if st.session_state.scraping_in_progress:
+if active_job_id and not JobStatusStore.is_terminal(active_job_id):
     time.sleep(2)
     st.rerun()

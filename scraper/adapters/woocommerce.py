@@ -50,7 +50,9 @@ class WooCommerceAdapter(ProductAdapter):
         self,
         url: str,
         max_products: Optional[int] = None,
-        use_browser: bool = False
+        use_browser: bool = False,
+        stop_event=None,
+        progress_callback=None,
     ) -> List[Any]:
         parsed = urlparse(url)
         root = f"{parsed.scheme}://{parsed.netloc}"
@@ -71,7 +73,8 @@ class WooCommerceAdapter(ProductAdapter):
         # Fallback to HTML crawling of product links
         html = fetch_html(url)
         if not html:
-            return [url]
+            logger.warning(f"WooCommerce discovery failed: no Store API data and no HTML from {url}")
+            return []
 
         soup = BeautifulSoup(html, "html.parser")
         product_links = set()
@@ -87,7 +90,9 @@ class WooCommerceAdapter(ProductAdapter):
             res = list(product_links)
             return res[:max_products] if max_products else res
 
-        return [url]
+        # Explicit discovery failure — never return the category URL as a fake product
+        logger.warning(f"WooCommerce discovery found no product links on {url}")
+        return []
 
     def extract_product(
         self,

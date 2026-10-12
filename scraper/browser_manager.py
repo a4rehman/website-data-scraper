@@ -3,8 +3,13 @@ Centralized Playwright Browser Manager
 
 Provides proper lifecycle management for headless browser instances
 to prevent resource leaks and ensure clean shutdown.
+Includes an explicit availability diagnostic so the UI can warn when
+Chromium is missing instead of silently claiming JS extraction works.
 """
 
+import os
+import subprocess
+import sys
 import threading
 import logging
 import config
@@ -13,6 +18,109 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 logger = logging.getLogger("scraper")
+
+# Cached browser availability probe so we don't launch Chromium repeatedly.
+_browser_diag_lock = threading.Lock()
+_browser_diagnostic: Optional[Dict[str, Any]] = None
+
+
+def check_browser_available(force_recheck: bool = False) -> Dict[str, Any]:
+    """
+    Probes whether Playwright and a Chromium executable are available.
+    Returns {"available": bool, "playwright_installed": bool, "message": str}.
+    Result is cached process-wide; pass force_recheck=True to probe again.
+    """
+    global _browser_diagnostic
+    with _browser_diag_lock:
+        if _browser_diagnostic is not None and not force_recheck:
+            return dict(_browser_diagnostic)
+
+    diagnostic: Dict[str, Any] = {
+        "available": False,
+        "playwright_installed": False,
+        "executable_path": "",
+        "message": "",
+    }
+
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+        diagnostic["playwright_installed"] = True
+    except ImportError:
+        diagnostic["message"] = (
+            "Playwright is not installed. JavaScript browser extraction is unavailable; "
+            "static HTML/JSON extraction will still run."
+        )
+        logger.warning(diagnostic["message"])
+        with _browser_diag_lock:
+            _browser_diagnostic = diagnostic
+        return dict(diagnostic)
+
+    # Locate the Chromium executable without launching a full browser.
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "--dry-run", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        # Playwright >=1.30 prints install location lines; older versions may not
+        # support --dry-run, which is fine — fall through to a launch probe.
+        if "Install location" in output or "install location" in output.lower():
+            diagnostic["executable_path"] = output.strip().splitlines()[-1]
+    except Exception:
+        pass
+
+    # Lightweight launch probe (cached after first success).
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            browser.close()
+        diagnostic["available"] = True
+        diagnostic["message"] = "Playwright Chromium is available."
+    except Exception as e:
+        diagnostic["available"] = False
+        diagnostic["message"] = (
+            f"Playwright is installed but Chromium could not launch: {type(e).__name__}: {e}. "
+            "Run 'python -m playwright install chromium' (done automatically in the deployment "
+            "postBuild script). Falling back to non-browser extraction."
+        )
+        logger.warning(diagnostic["message"])
+
+    with _browser_diag_lock:
+        _browser_diagnostic = diagnostic
+    return dict(diagnostic)
+
+
+def ensure_chromium_installed(timeout: int = 300) -> bool:
+    """
+    Installs the Chromium browser binary via the Playwright CLI if missing.
+    Safe to call multiple times (no-op when already installed).
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode == 0:
+            logger.info("Playwright Chromium installed successfully.")
+            return True
+        logger.warning(
+            f"playwright install chromium failed (rc={result.returncode}): "
+            f"{(result.stderr or result.stdout or '')[:500]}"
+        )
+        return False
+    except Exception as e:
+        logger.warning(f"Could not run playwright install chromium: {e}")
+        return False
+
+
+# Auto-install Chromium at import time only when explicitly requested
+# (the Streamlit Cloud postBuild script handles deployment installs).
+if os.getenv("PLAYWRIGHT_AUTO_INSTALL", "false").lower() == "true":
+    threading.Thread(target=ensure_chromium_installed, daemon=True).start()
 
 
 @dataclass

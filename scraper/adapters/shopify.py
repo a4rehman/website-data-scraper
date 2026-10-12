@@ -52,7 +52,9 @@ class ShopifyAdapter(ProductAdapter):
         self,
         url: str,
         max_products: Optional[int] = None,
-        use_browser: bool = False
+        use_browser: bool = False,
+        stop_event=None,
+        progress_callback=None,
     ) -> List[Any]:
         parsed = urlparse(url)
         root = f"{parsed.scheme}://{parsed.netloc}"
@@ -77,6 +79,9 @@ class ShopifyAdapter(ProductAdapter):
         limit = 250
 
         while True:
+            if stop_event is not None and stop_event.is_set():
+                logger.warning("Shopify discovery cancelled by user")
+                break
             data = fetch_json(api_endpoint, params={"page": page, "limit": limit})
             if not data or not isinstance(data, dict) or "products" not in data or not data["products"]:
                 break
@@ -84,6 +89,14 @@ class ShopifyAdapter(ProductAdapter):
             batch = data["products"]
             discovered.extend(batch)
             logger.info(f"  Shopify Page {page}: Found {len(batch)} products (Total: {len(discovered)})")
+            if progress_callback:
+                try:
+                    progress_callback({
+                        "status": f"Discovering products (Shopify page {page}: {len(discovered)} found)...",
+                        "discovered": len(discovered),
+                    })
+                except Exception:
+                    pass
 
             if max_products and len(discovered) >= max_products:
                 discovered = discovered[:max_products]
@@ -93,9 +106,13 @@ class ShopifyAdapter(ProductAdapter):
                 break
             page += 1
 
-        # Fallback to direct single URL if nothing found
+        # Explicit discovery failure — do NOT return the collection URL as a fake product
         if not discovered:
-            return [url]
+            logger.warning(
+                f"Shopify discovery returned no products from {api_endpoint}. "
+                "The products.json endpoint may be disabled or blocked."
+            )
+            return []
 
         return discovered
 

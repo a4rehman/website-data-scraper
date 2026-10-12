@@ -85,10 +85,15 @@ class PaginationEngine:
                 logger.info(f"No products found on page {page_num}, stopping pagination")
                 break
             
-            # Filter duplicates
+            # Filter duplicates — items may be dicts or product URL strings
             new_products = []
             for p in products:
-                product_url = p.get("product_url") or p.get("url") or ""
+                if isinstance(p, str):
+                    product_url = p
+                elif isinstance(p, dict):
+                    product_url = p.get("product_url") or p.get("url") or ""
+                else:
+                    continue  # Unknown item shape; skip safely
                 if product_url and product_url not in self.seen_product_urls:
                     self.seen_product_urls.add(product_url)
                     new_products.append(p)

@@ -1,0 +1,12 @@
+#!/bin/bash
+# Streamlit Community Cloud build script.
+# Installs the Playwright Chromium binary so browser-based extraction works
+# in the deployed environment (packages.txt already provides the OS libraries).
+set -e
+
+echo "Installing Playwright Chromium for browser-based extraction..."
+python -m playwright install chromium || {
+  echo "WARNING: playwright install chromium failed; browser extraction will be unavailable."
+  echo "The app will fall back to static HTML/JSON extraction and show a diagnostic."
+}
+echo "Browser setup complete."

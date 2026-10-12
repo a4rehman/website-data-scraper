@@ -1,10 +1,15 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from urllib.parse import urlparse
 
 class ProductAdapter(ABC):
     """
     Abstract base class for all website and platform adapters.
+
+    Discovery item schema: discover_products() returns a list where each item is
+    either a product dictionary (with at least "product_url") or a product URL
+    string. Adapters must never return a category/collection URL as a product
+    when discovery fails — return an empty list instead.
     """
     name: str = "Base"
 
@@ -27,10 +32,13 @@ class ProductAdapter(ABC):
         self,
         url: str,
         max_products: Optional[int] = None,
-        use_browser: bool = False
+        use_browser: bool = False,
+        stop_event: Optional[Any] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> List[Any]:
         """
         Discovers product URLs or raw product objects from a category, collection, or search URL.
+        Returns an empty list (never the input URL) when discovery fails.
         """
         pass
 
@@ -43,6 +51,7 @@ class ProductAdapter(ABC):
     ) -> Optional[Dict[str, Any]]:
         """
         Extracts product details from a single product URL or raw item data into the Universal Schema.
+        Must accept both string URLs and dictionary discovery items.
         """
         pass
 

@@ -1,7 +1,7 @@
 import json
 import re
-from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse, urljoin
+from typing import List, Dict, Any, Optional, Union
+from urllib.parse import urlparse, urljoin, urlunparse, parse_qsl, urlencode
 from bs4 import BeautifulSoup
 import config
 from scraper.adapters.base import ProductAdapter
@@ -16,6 +16,55 @@ from scraper.utils import fetch_html, logger
 from scraper.pagination import discover_with_pagination
 from scraper.browser_manager import render_page, extract_with_playwright, BrowserConfig
 
+# Discovery item schema (agreed across adapters/engine):
+#   - dict with at least "product_url" (optional: product_name, price, image_url, ...)
+#   - plain product URL string
+DiscoveryItem = Union[str, Dict[str, Any]]
+
+# Path markers that identify product detail pages (Shopify "/products/handle" included)
+PRODUCT_PATH_MARKERS = ("/products/", "/product/", "/p/", "/item/", "/dp/", "/goods/", "/buy/")
+# Path markers that identify non-product listing/navigation pages
+NON_PRODUCT_PATH_MARKERS = (
+    "/collections/", "/collection/", "/category/", "/categories/",
+    "/cart", "/checkout", "/search", "/pages/", "/blogs/", "/about",
+    "/contact", "/policy", "/policies/", "/account", "/faq",
+)
+
+
+def _is_product_path(path: str) -> bool:
+    """True when a URL path looks like a product detail page."""
+    path = path.lower().rstrip("/")
+    if not path or path.endswith("/products") or path.endswith("/product"):
+        return False
+    if any(m in path for m in NON_PRODUCT_PATH_MARKERS):
+        # /collections/x is a listing even if it contains /products later
+        if "/products/" not in path:
+            return False
+    return any(path.startswith(m) or m in path for m in PRODUCT_PATH_MARKERS)
+
+
+def _normalize_product_url(url: str, base_url: str) -> str:
+    """Resolve relative/protocol-relative URLs and strip fragments and tracking params."""
+    if not url:
+        return ""
+    url = url.strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    full = urljoin(base_url, url)
+    try:
+        parsed = urlparse(full)
+    except Exception:
+        return full
+    if parsed.scheme not in ("http", "https"):
+        return ""
+    # Drop fragment and common tracking query params; keep meaningful ones (e.g. variant)
+    keep = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+            if not k.lower().startswith("utm_") and k.lower() not in ("fbclid", "gclid", "mc_cid", "mc_eid")]
+    query = urlencode(keep)
+    normalized = urlunparse((parsed.scheme, parsed.netloc.lower(), parsed.path.rstrip("/"), "", query, ""))
+    return normalized
+
+
 class GenericAdapter(ProductAdapter):
     name: str = "Generic E-Commerce"
 
@@ -28,7 +77,7 @@ class GenericAdapter(ProductAdapter):
         path = parsed.path.lower()
 
         # Check page type indicators
-        if any(kw in path for kw in ["/product/", "/p/", "/item/", "/dp/", "/goods/", "/buy/"]):
+        if _is_product_path(path):
             page_type = "Product"
         elif any(kw in path for kw in ["/category/", "/collection/", "/collections/", "/c/", "/cat/", "/shop/", "/catalog/"]):
             page_type = "Category / Listing"
@@ -66,71 +115,98 @@ class GenericAdapter(ProductAdapter):
         self,
         url: str,
         max_products: Optional[int] = None,
-        use_browser: bool = False
-    ) -> List[Any]:
+        use_browser: bool = False,
+        stop_event=None,
+        progress_callback=None,
+    ) -> List[DiscoveryItem]:
         parsed = urlparse(url)
-        path = parsed.path.lower()
 
         # If clearly a single product URL, return it directly
-        if any(kw in path for kw in ["/product/", "/p/", "/item/", "/dp/"]) and not any(kw in path for kw in ["/category/", "/categories/"]):
+        if _is_product_path(parsed.path):
             return [url]
 
         logger.info(f"GenericAdapter: Discovering products from {url}")
-        
-        # Define product extraction function for pagination engine
+        base_netloc = parsed.netloc.lower()
+
         def extract_from_page(page_url: str) -> List[Dict[str, Any]]:
             html = fetch_html(page_url)
+            browser_note = ""
+            if not html and use_browser:
+                logger.info(f"Static HTML empty for {page_url}; attempting browser rendering...")
+                html = render_page(page_url, scroll=True, config=BrowserConfig(timeout=45000))
+                if not html:
+                    browser_note = "browser rendering unavailable or failed (Chromium missing/blocked?)"
+                    logger.warning(f"Browser rendering failed for {page_url}: {browser_note}")
+
             if not html:
+                logger.warning(f"No HTML retrieved from {page_url} (blocked, empty, or fetch failed)")
                 return []
-            
+
             soup = BeautifulSoup(html, "html.parser")
             items: List[Dict[str, Any]] = []
-            
-            # Strategy 1: JSON-LD ItemList
+
+            # Strategy 1: JSON-LD ItemList / Product objects
             jsonld_items = self._extract_jsonld_listing(soup, page_url)
             if jsonld_items:
                 items.extend(jsonld_items)
-            
+
             # Strategy 2: Next.js __NEXT_DATA__
             if not items:
                 next_items = self._extract_nextjs_data(soup, page_url)
                 if next_items:
                     items.extend(next_items)
-            
+
             # Strategy 3: HTML Product Link / Card Discovery
             if not items:
                 cards = self._extract_html_product_cards(soup, page_url)
                 if cards:
                     items.extend(cards)
-            
-            # Strategy 4: Fallback to link crawler
+
+            # Strategy 4: Fallback to generic product-link crawl (same domain only)
             if not items:
                 seen_links = set()
                 for a in soup.find_all("a", href=True):
-                    href = a["href"]
-                    full_link = urljoin(page_url, href)
-                    parsed_link = urlparse(full_link)
-                    if parsed_link.netloc == parsed.netloc:
-                        if any(kw in parsed_link.path.lower() for kw in ["/product/", "/p/", "/item/", "/goods/"]):
-                            if full_link not in seen_links:
-                                seen_links.add(full_link)
-                                items.append({"product_url": full_link})
-            
+                    full_link = _normalize_product_url(a["href"], page_url)
+                    if not full_link:
+                        continue
+                    if urlparse(full_link).netloc.lower() != base_netloc:
+                        continue
+                    if _is_product_path(urlparse(full_link).path) and full_link not in seen_links:
+                        seen_links.add(full_link)
+                        items.append({"product_url": full_link})
+
             return items
-        
+
         # Use pagination engine to discover across all pages
         discovered_items = discover_with_pagination(
             url=url,
             extract_products_fn=extract_from_page,
             max_products=max_products,
-            use_browser=use_browser
+            use_browser=use_browser,
+            stop_event=stop_event,
+            progress_callback=progress_callback,
         )
-        
+
         if not discovered_items:
-            logger.warning(f"No listing items discovered on {url}. Retaining target URL.")
-            return [url]
-        
-        return discovered_items
+            # Explicit discovery failure — NEVER return the category/collection URL
+            # as a fake product. The engine surfaces this as a clear Failed state.
+            logger.warning(
+                f"GenericAdapter: discovery failed for {url} — no product items found "
+                "(site may block automated access or require JavaScript rendering)."
+            )
+            return []
+
+        # Dedupe by product URL, preserving order
+        seen = set()
+        deduped: List[DiscoveryItem] = []
+        for item in discovered_items:
+            key = item.get("product_url", "") if isinstance(item, dict) else str(item)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            deduped.append(item)
+        return deduped
 
     def extract_product(
         self,
@@ -140,8 +216,24 @@ class GenericAdapter(ProductAdapter):
         html_content: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         # If pre-extracted dictionary with product data
-        if isinstance(url_or_raw, dict) and (url_or_raw.get("product_name") or url_or_raw.get("name") or url_or_raw.get("title")):
-            return normalize_universal_product(url_or_raw, source_url=source_url or url_or_raw.get("product_url", ""))
+        if isinstance(url_or_raw, dict):
+            # Discovery dicts may be {"product_url": ...} only, or carry full fields.
+            product_url = str(url_or_raw.get("product_url") or url_or_raw.get("url") or "")
+            has_payload = bool(
+                url_or_raw.get("product_name") or url_or_raw.get("name") or url_or_raw.get("title")
+            )
+            if has_payload:
+                return normalize_universal_product(
+                    url_or_raw, source_url=source_url or product_url
+                )
+            if product_url:
+                return self.extract_product(
+                    product_url,
+                    source_url=source_url,
+                    use_browser=use_browser,
+                    html_content=html_content,
+                )
+            return None
 
         # If URL string
         if isinstance(url_or_raw, str):
@@ -174,33 +266,56 @@ class GenericAdapter(ProductAdapter):
 
         return None
 
+    @staticmethod
+    def _iter_jsonld_nodes(data: Any):
+        """
+        Recursively yields every dict node in a parsed JSON-LD structure,
+        flattening lists and @graph containers. Non-dict nodes are skipped
+        (never call .get() on strings).
+        """
+        if isinstance(data, dict):
+            yield data
+            graph = data.get("@graph")
+            if isinstance(graph, (list, dict)):
+                yield from GenericAdapter._iter_jsonld_nodes(graph)
+        elif isinstance(data, list):
+            for elem in data:
+                yield from GenericAdapter._iter_jsonld_nodes(elem)
+
+    @staticmethod
+    def _jsonld_type_is(node: Dict[str, Any], type_name: str) -> bool:
+        """True when a JSON-LD node's @type matches type_name (str or list forms)."""
+        node_type = node.get("@type")
+        if isinstance(node_type, str):
+            return node_type == type_name
+        if isinstance(node_type, list):
+            return type_name in node_type
+        return False
+
     def _try_jsonld_single(self, soup: BeautifulSoup, base_url: str) -> Optional[Dict[str, Any]]:
         for script in soup.find_all("script", type="application/ld+json"):
             try:
-                data = json.loads(script.string)
+                data = json.loads(script.string or "")
             except Exception:
                 continue
 
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if item.get("@type") == "Product":
+            for item in self._iter_jsonld_nodes(data):
+                if self._jsonld_type_is(item, "Product"):
                     return self._parse_jsonld_product(item, base_url)
-                elif "@graph" in item:
-                    for node in item["@graph"]:
-                        if node.get("@type") == "Product":
-                            return self._parse_jsonld_product(node, base_url)
         return None
 
     def _parse_jsonld_product(self, item: Dict[str, Any], base_url: str) -> Dict[str, Any]:
         name = item.get("name", "")
-        desc = clean_html_description(item.get("description", ""))
+        desc = clean_html_description(item.get("description", "") or "")
         sku = str(item.get("sku") or item.get("productID") or "")
         brand_val = item.get("brand")
         brand = brand_val.get("name", "") if isinstance(brand_val, dict) else str(brand_val or "")
 
         offers = item.get("offers", {})
         if isinstance(offers, list):
-            offers = offers[0] if offers else {}
+            offers = next((o for o in offers if isinstance(o, dict)), {})
+        if not isinstance(offers, dict):
+            offers = {}
 
         price = offers.get("price") or offers.get("lowPrice", "")
         curr = offers.get("priceCurrency", "")
@@ -211,6 +326,9 @@ class GenericAdapter(ProductAdapter):
         raw_img = item.get("image", [])
         if isinstance(raw_img, (str, dict)):
             raw_img = [raw_img]
+        if not isinstance(raw_img, list):
+            raw_img = []
+        raw_img = [img for img in raw_img if isinstance(img, (str, dict))]
         main_img, add_imgs, all_imgs = process_images(raw_img, base_url=base_url)
 
         payload = {
@@ -245,22 +363,39 @@ class GenericAdapter(ProductAdapter):
         return normalize_universal_product(payload, source_url=base_url)
 
     def _extract_jsonld_listing(self, soup: BeautifulSoup, base_url: str) -> List[Dict[str, Any]]:
-        products = []
+        products: List[Dict[str, Any]] = []
         for script in soup.find_all("script", type="application/ld+json"):
             try:
-                data = json.loads(script.string)
+                data = json.loads(script.string or "")
             except Exception:
                 continue
 
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if item.get("@type") == "ItemList":
-                    for elem in item.get("itemListElement", []):
-                        inner = elem.get("item", elem)
-                        if inner.get("@type") == "Product":
-                            products.append(self._parse_jsonld_product(inner, base_url))
-                        elif isinstance(inner, str) and inner.startswith("http"):
-                            products.append({"product_url": inner})
+            for node in self._iter_jsonld_nodes(data):
+                if self._jsonld_type_is(node, "Product"):
+                    products.append(self._parse_jsonld_product(node, base_url))
+                elif self._jsonld_type_is(node, "ItemList"):
+                    elements = node.get("itemListElement", [])
+                    if not isinstance(elements, list):
+                        continue
+                    for elem in elements:
+                        # elem may be a Product dict, a {"item": {...}} wrapper,
+                        # or a bare URL string.
+                        if isinstance(elem, str):
+                            url = _normalize_product_url(elem, base_url)
+                            if url:
+                                products.append({"product_url": url})
+                        elif isinstance(elem, dict):
+                            inner = elem.get("item", elem)
+                            if isinstance(inner, str):
+                                url = _normalize_product_url(inner, base_url)
+                                if url:
+                                    products.append({"product_url": url})
+                            elif isinstance(inner, dict) and self._jsonld_type_is(inner, "Product"):
+                                products.append(self._parse_jsonld_product(inner, base_url))
+                            elif isinstance(inner, dict):
+                                url = _normalize_product_url(str(inner.get("url") or inner.get("@id") or ""), base_url)
+                                if url and _is_product_path(urlparse(url).path):
+                                    products.append({"product_url": url})
         return products
 
     def _extract_nextjs_data(self, soup: BeautifulSoup, base_url: str) -> List[Dict[str, Any]]:
@@ -278,16 +413,28 @@ class GenericAdapter(ProductAdapter):
         if isinstance(node, dict):
             if ("title" in node or "name" in node) and ("price" in node or "priceRange" in node or "variants" in node):
                 name = node.get("title") or node.get("name")
-                price = node.get("price") or (node.get("priceRange") or {}).get("minVariantPrice", {}).get("amount")
+                price = node.get("price")
+                if price is None and isinstance(node.get("priceRange"), dict):
+                    price_range = node.get("priceRange") or {}
+                    min_price = price_range.get("minVariantPrice")
+                    if isinstance(min_price, dict):
+                        price = min_price.get("amount")
                 url = node.get("url") or node.get("slug") or node.get("handle")
-                full_url = urljoin(base_url, str(url)) if url else base_url
+                full_url = urljoin(base_url, str(url)) if url else ""
                 if name:
+                    raw_image = node.get("image")
+                    if isinstance(raw_image, dict):
+                        image_url = raw_image.get("url", "")
+                    elif isinstance(raw_image, str):
+                        image_url = raw_image
+                    else:
+                        image_url = ""
                     found.append({
                         "product_name": name,
                         "title": name,
                         "price": price,
                         "product_url": full_url,
-                        "image_url": (node.get("image") or {}).get("url", "") if isinstance(node.get("image"), dict) else str(node.get("image") or "")
+                        "image_url": image_url,
                     })
 
             for k, v in node.items():
@@ -315,10 +462,10 @@ class GenericAdapter(ProductAdapter):
         
         # Signal 1: Product-like URL pattern (strong signal)
         link_el = card.find("a", href=True)
-        link = urljoin(base_url, link_el["href"]) if link_el else ""
+        link = _normalize_product_url(link_el["href"], base_url) if link_el else ""
         if link:
             path = urlparse(link).path.lower()
-            if any(kw in path for kw in ["/product/", "/p/", "/item/", "/dp/", "/goods/", "/buy/"]):
+            if _is_product_path(path):
                 score += 30
                 signals["url_pattern"] = True
         
@@ -401,11 +548,17 @@ class GenericAdapter(ProductAdapter):
             # Modern data attributes
             "[data-testid*='product']", "[data-testid*='item']",
             "[data-product-id]", "[data-item-id]", "[data-sku]",
-            # Common class patterns
+            # Common class patterns (exact tokens)
             ".product-card", ".productCard", ".product_card", ".ProductCard",
             ".product-item", ".productItem", ".goods-item", ".search-item",
             ".product-tile", ".productTile", ".item-card", ".itemCard",
             ".product-grid-item", ".product-list-item",
+            # Substring class patterns (Shopify Dawn "product-card-wrapper", etc.)
+            "[class*='product-card']", "[class*='productCard']",
+            "[class*='product_card']", "[class*='ProductCard']",
+            "[class*='product-item']", "[class*='productItem']",
+            "[class*='goods-item']", "[class*='goodsItem']",
+            "[class*='search-item']", "[class*='searchItem']",
             # Semantic HTML
             "article.product", "li.product", "div.product",
             # E-commerce specific
@@ -439,12 +592,20 @@ class GenericAdapter(ProductAdapter):
                     logger.debug(f"Found {len(cards)} candidate cards by class grouping: {cls}")
                     break
         
+        base_path = urlparse(base_url).path.rstrip("/").lower()
         for card in cards:
             candidate = self._score_product_candidate(card, base_url)
             if candidate:
                 product_url = candidate.get("product_url", "")
                 product_name = candidate.get("product_name", "")
-                
+
+                # Require a real, distinct product URL — never emit the
+                # listing/collection URL itself as a product.
+                if not product_url or product_url.rstrip("/").lower().endswith(base_path or "/"):
+                    continue
+                if not _is_product_path(urlparse(product_url).path) and not product_name:
+                    continue
+
                 # Deduplicate by URL or name
                 dedup_key = product_url or product_name
                 if dedup_key in seen_urls:

@@ -49,7 +49,9 @@ class TemuAdapter(ProductAdapter):
         self,
         url: str,
         max_products: Optional[int] = None,
-        use_browser: bool = False
+        use_browser: bool = False,
+        stop_event=None,
+        progress_callback=None,
     ) -> List[Any]:
         parsed = urlparse(url)
         path = parsed.path.lower()
@@ -88,9 +90,9 @@ class TemuAdapter(ProductAdapter):
                     discovered_items.append(item)
 
         if not discovered_items:
-            # Fallback to the target URL itself so single extraction can attempt
-            logger.warning(f"No listing items discovered on Temu page. Retaining target URL: {url}")
-            return [url]
+            # Explicit discovery failure — never return the category URL as a fake product
+            logger.warning(f"No listing items discovered on Temu page: {url}")
+            return []
 
         if max_products and len(discovered_items) > max_products:
             discovered_items = discovered_items[:max_products]
