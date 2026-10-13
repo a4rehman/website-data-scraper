@@ -267,8 +267,8 @@ def normalize_universal_product(data: Dict[str, Any], source_url: str = "") -> D
     raw_desc = data.get("description") or ""
     clean_desc = clean_html_description(raw_desc) if "<" in raw_desc else raw_desc.strip()
 
-    # Availability
-    avail = data.get("availability") or data.get("stock_status") or "In Stock"
+    # Availability — never fabricate a stock status the source didn't provide.
+    avail = data.get("availability") or data.get("stock_status") or ""
     stock = data.get("stock_status") or avail
 
     # Currency

@@ -217,10 +217,20 @@ class UniversalScrapingEngine:
             page_type=analysis.get("page_type", ""),
         )
         try:
+            def discovery_progress(payload: Dict[str, Any]) -> None:
+                if isinstance(payload, dict):
+                    emit(
+                        STATE_DISCOVERING,
+                        str(payload.get("message") or "Discovering products..."),
+                        discovered=int(payload.get("discovered") or 0),
+                    )
+
             discovered_raw = adapter.discover_products(
                 url,
                 max_products=max_products,
                 use_browser=use_browser,
+                stop_event=stop_event,
+                progress_callback=discovery_progress,
             )
         except Exception as e:
             logger.exception(f"Product discovery raised for {url}")
