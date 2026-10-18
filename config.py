@@ -90,6 +90,7 @@ UNIVERSAL_CSV_COLUMNS = [
     "availability_source",
     "category_source",
     "variants_source",
+    "currency_source",
 ]
 
 # Default output paths (for backward compatibility / CLI)

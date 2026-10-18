@@ -294,6 +294,11 @@ def normalize_universal_product(data: Dict[str, Any], source_url: str = "") -> D
     availability_source = data.get("availability_source") or ""
     category_source = data.get("category_source") or ""
     variants_source = data.get("variants_source") or ""
+    currency_source = data.get("currency_source") or (
+        "price_text" if (curr and (detect_currency(raw_price) or detect_currency(raw_orig))) else (
+            "not_found" if not curr else "provided"
+        )
+    )
 
     return {
         "source_domain": source_domain,
@@ -349,6 +354,7 @@ def normalize_universal_product(data: Dict[str, Any], source_url: str = "") -> D
         "availability_source": availability_source,
         "category_source": category_source,
         "variants_source": variants_source,
+        "currency_source": currency_source,
     }
 
 def deduplicate_products(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:

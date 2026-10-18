@@ -331,3 +331,108 @@ def test_schema_includes_compare_at_price():
     assert p["sale_price"] == 4000
     assert p["original_price"] == 6000
     assert p["compare_at_price"] == 6000
+
+
+# ==============================================================================
+# Group F: Currency Extraction (regression: Tehzeeb Libas exported empty currency)
+# ==============================================================================
+
+def test_currency_is_in_schema():
+    """currency and its provenance must be exported."""
+    assert "currency" in config.UNIVERSAL_CSV_COLUMNS
+    assert "currency_source" in config.UNIVERSAL_CSV_COLUMNS
+
+
+def test_shopify_variant_level_currency(monkeypatch):
+    """
+    Single-product endpoint (/products/{h}.json) includes price_currency per variant.
+    Currency must be captured without triggering any network probe.
+    """
+    adapter = ShopifyAdapter()
+    probed = []
+    monkeypatch.setattr(adapter, "_get_store_currency", lambda root: probed.append(root) or "")
+
+    parsed = adapter._parse_shopify_raw(
+        {
+            "id": 1, "title": "CURRENCY ITEM", "handle": "currency-item",
+            "variants": [
+                {"id": 1, "title": "S", "sku": "S1", "price": "2990.00",
+                 "compare_at_price": "14950.00", "available": True, "price_currency": "PKR"},
+            ],
+        },
+        source_url="https://tehzeeblibas.com/products/currency-item",
+    )
+    assert parsed["currency"] == "PKR"
+    assert parsed["currency_source"] == "shopify_json.variants[].price_currency"
+    assert probed == [], "must not hit the network when the API already provides currency"
+
+
+def test_shopify_product_level_currency(monkeypatch):
+    """Fallback to a product-level currency field when variants omit price_currency."""
+    adapter = ShopifyAdapter()
+    monkeypatch.setattr(adapter, "_get_store_currency", lambda root: "")
+
+    parsed = adapter._parse_shopify_raw(
+        {
+            "id": 2, "title": "PRODUCT LEVEL", "handle": "product-level",
+            "price_currency": "USD",
+            "variants": [{"id": 1, "title": "S", "sku": "S1", "price": "10.00", "available": True}],
+        },
+        source_url="https://example.com/products/product-level",
+    )
+    assert parsed["currency"] == "USD"
+    assert parsed["currency_source"] == "shopify_json.price_currency"
+
+
+def test_shopify_storefront_probe_fallback(monkeypatch):
+    """
+    Collection endpoint (/collections/all/products.json) omits price_currency.
+    Regression: Tehzeeb Libas collection scrapes exported an EMPTY currency column.
+    The adapter must fall back to a single cached storefront probe.
+    """
+    adapter = ShopifyAdapter()
+    monkeypatch.setattr(adapter, "_get_store_currency", lambda root: "PKR")
+
+    parsed = adapter._parse_shopify_raw(
+        {
+            "id": 3, "title": "COLLECTION ITEM", "handle": "collection-item",
+            "variants": [
+                {"id": 1, "title": "S", "sku": "S1", "price": "2990.00",
+                 "compare_at_price": "14950.00", "available": True},
+            ],
+        },
+        source_url="https://tehzeeblibas.com/collections/all",
+    )
+    assert parsed["currency"] == "PKR"
+    assert parsed["currency_source"] == "storefront.Shopify.currency.active"
+
+
+def test_currency_is_never_fabricated(monkeypatch):
+    """
+    When no currency evidence exists anywhere, the field must stay EMPTY.
+    An empty currency is honest; a guessed one corrupts downstream analysis.
+    """
+    adapter = ShopifyAdapter()
+    monkeypatch.setattr(adapter, "_get_store_currency", lambda root: "")
+
+    parsed = adapter._parse_shopify_raw(
+        {"id": 4, "title": "UNKNOWN CURRENCY", "handle": "unknown-currency",
+         "variants": [{"id": 1, "title": "S", "sku": "S1", "price": "1000", "available": True}]},
+        source_url="https://example.com/products/unknown-currency",
+    )
+    assert parsed["currency"] == ""
+    assert parsed["currency_source"] == "not_found"
+
+
+def test_storefront_currency_probe_parses_shopify_currency(monkeypatch):
+    """The storefront probe must read Shopify.currency.active without guessing."""
+    import re
+    adapter = ShopifyAdapter()
+    html = '<script>Shopify = {};Shopify.currency = {"active":"PKR","rate":"1.0"};</script>'
+    for pattern in __import__("scraper.adapters.shopify", fromlist=["_CURRENCY_PATTERNS"])._CURRENCY_PATTERNS:
+        m = pattern.search(html)
+        if m:
+            assert m.group(1).upper() == "PKR"
+            break
+    else:
+        raise AssertionError("No currency pattern matched the Shopify.currency payload")

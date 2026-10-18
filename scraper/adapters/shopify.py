@@ -14,8 +14,60 @@ from scraper.cleaners import (
 )
 from scraper.utils import fetch_json, fetch_html, logger
 
+# Cache of resolved store currency, keyed by scheme://host (one probe per store per process)
+_STORE_CURRENCY_CACHE: Dict[str, str] = {}
+
+# Ordered from most to least specific to avoid false positives
+_CURRENCY_PATTERNS = [
+    re.compile(r'Shopify\.currency\s*=\s*\{[^}]*?["\']active["\']\s*:\s*["\']([A-Za-z]{3})["\']'),
+    re.compile(r'["\']priceCurrency["\']\s*:\s*["\']([A-Za-z]{3})["\']'),
+    re.compile(r'["\']currency["\']\s*:\s*["\']([A-Za-z]{3})["\']'),
+]
+
+
 class ShopifyAdapter(ProductAdapter):
     name: str = "Shopify"
+
+    def _get_store_currency(self, root: str) -> str:
+        """
+        Resolves the store's active currency with a small number of cached requests.
+
+        The collection listing endpoint (/collections/all/products.json) omits
+        `price_currency`, so bulk scrapes have no per-product currency. A single
+        storefront probe recovers it from schema.org JSON-LD (`priceCurrency`) or
+        the theme's `Shopify.currency.active`. Never guesses: returns "" when unknown.
+        """
+        if not root:
+            return ""
+        if root in _STORE_CURRENCY_CACHE:
+            return _STORE_CURRENCY_CACHE[root]
+
+        currency = ""
+        # /collections/all is preferred: it always contains product JSON-LD with priceCurrency.
+        for probe_url in (f"{root}/collections/all", f"{root}/"):
+            try:
+                html = fetch_html(probe_url)
+            except Exception as exc:
+                logger.debug(f"Currency probe failed for {probe_url}: {exc}")
+                continue
+            if not html:
+                continue
+            for pattern in _CURRENCY_PATTERNS:
+                match = pattern.search(html)
+                if match:
+                    candidate = match.group(1).upper()
+                    if candidate.isalpha() and len(candidate) == 3:
+                        currency = candidate
+                        break
+            if currency:
+                break
+
+        if currency:
+            logger.info(f"Resolved store currency for {root}: {currency}")
+        else:
+            logger.warning(f"Could not resolve store currency for {root}; currency will be left empty.")
+        _STORE_CURRENCY_CACHE[root] = currency
+        return currency
 
     def can_handle(self, url: str, html: Optional[str] = None) -> bool:
         if "myshopify.com" in url.lower():
@@ -23,6 +75,23 @@ class ShopifyAdapter(ProductAdapter):
         if html:
             if "cdn.shopify.com" in html or "window.Shopify" in html or "Shopify.theme" in html or "/products.json" in html:
                 return True
+
+        # URL-only detection. This matters because adapter selection must not
+        # silently degrade to the generic fallback just because the preview
+        # fetch was rate-limited (429) or timed out — that produced garbage
+        # titles such as "Rs.2,990" from unrelated page text.
+        try:
+            parsed = urlparse(url)
+            path = parsed.path.lower()
+            if "/collections/" in path or path.endswith("/products.json"):
+                return True
+            if path.startswith("/cart") or path.startswith("/checkout"):
+                return True
+            # Shopify appends ?variant=<id> to product links
+            if "/products/" in path and "variant=" in (parsed.query or ""):
+                return True
+        except Exception:
+            pass
         return False
 
     def analyze_url(self, url: str, html: Optional[str] = None) -> Dict[str, Any]:
@@ -64,19 +133,62 @@ class ShopifyAdapter(ProductAdapter):
         if "/products/" in path and not path.endswith("/products.json") and not path.endswith("/products"):
             return [url]
 
-        # If collection URL
+        # If collection URL, ALWAYS prefer the collection-scoped endpoint.
+        #
+        # Regression: `/collections/all` used to fall through to the root
+        # `/products.json`. On some stores that endpoint serves cached prices
+        # that do NOT match the storefront — Tehzeeb Libas reported 5100 for a
+        # product whose page displayed 4250 (exactly 1.2x higher). The
+        # collection endpoint mirrors what the customer actually sees, so it
+        # is preferred for every collection, "all" included. Root
+        # `/products.json` is kept only as a fallback.
         collection_match = re.search(r'/collections/([^/?#]+)', path)
-        if collection_match and collection_match.group(1) != "all":
+        if collection_match:
             collection_handle = collection_match.group(1)
-            api_endpoint = f"{root}/collections/{collection_handle}/products.json"
+            api_endpoints = [
+                f"{root}/collections/{collection_handle}/products.json",
+                f"{root}/products.json",
+            ]
             logger.info(f"Discovering Shopify products from collection: {collection_handle}")
         else:
-            api_endpoint = f"{root}/products.json"
+            api_endpoints = [f"{root}/products.json"]
             logger.info(f"Discovering Shopify products from root: {root}")
 
-        discovered: List[Dict[str, Any]] = []
-        page = 1
         limit = 250
+        discovered: List[Dict[str, Any]] = []
+
+        for api_endpoint in api_endpoints:
+            page_results = self._paginate_json(
+                api_endpoint, max_products, stop_event, progress_callback, limit
+            )
+            if page_results:
+                discovered = page_results
+                break
+            logger.warning(
+                f"Shopify endpoint {api_endpoint} returned no products; trying fallback."
+            )
+
+        if discovered:
+            return discovered
+
+        # Explicit discovery failure — do NOT return the collection URL as a fake product
+        logger.warning(
+            f"Shopify discovery returned no products from {api_endpoints}. "
+            "The products.json endpoint may be disabled or blocked."
+        )
+        return []
+
+    def _paginate_json(
+        self,
+        api_endpoint: str,
+        max_products: Optional[int],
+        stop_event,
+        progress_callback,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Walks ?page= of a Shopify JSON listing endpoint until exhausted."""
+        results: List[Dict[str, Any]] = []
+        page = 1
 
         while True:
             if stop_event is not None and stop_event.is_set():
@@ -87,34 +199,25 @@ class ShopifyAdapter(ProductAdapter):
                 break
             
             batch = data["products"]
-            discovered.extend(batch)
-            logger.info(f"  Shopify Page {page}: Found {len(batch)} products (Total: {len(discovered)})")
+            results.extend(batch)
+            logger.info(f"  Shopify Page {page}: Found {len(batch)} products (Total: {len(results)})")
             if progress_callback:
                 try:
                     progress_callback({
-                        "status": f"Discovering products (Shopify page {page}: {len(discovered)} found)...",
-                        "discovered": len(discovered),
+                        "status": f"Discovering products (Shopify page {page}: {len(results)} found)...",
+                        "discovered": len(results),
                     })
                 except Exception:
                     pass
 
-            if max_products and len(discovered) >= max_products:
-                discovered = discovered[:max_products]
-                break
+            if max_products and len(results) >= max_products:
+                return results[:max_products]
 
             if len(batch) < limit:
                 break
             page += 1
 
-        # Explicit discovery failure — do NOT return the collection URL as a fake product
-        if not discovered:
-            logger.warning(
-                f"Shopify discovery returned no products from {api_endpoint}. "
-                "The products.json endpoint may be disabled or blocked."
-            )
-            return []
-
-        return discovered
+        return results
 
     def extract_product(
         self,
@@ -207,12 +310,20 @@ class ShopifyAdapter(ProductAdapter):
         prices = []
         compare_prices = []
         any_in_stock = False
+        currency_code = ""
+        currency_source = "not_found"
 
         for v in raw_variants:
             v_id = str(v.get("id", ""))
             v_sku = str(v.get("sku", "")).strip()
             if v_sku:
                 skus.append(v_sku)
+
+            # Currency is provided explicitly by the Shopify API per variant
+            v_currency = str(v.get("price_currency") or "").strip()
+            if v_currency and not currency_code:
+                currency_code = v_currency
+                currency_source = "shopify_json.variants[].price_currency"
             v_title = str(v.get("title", "")).strip()
             v_price = normalize_price(v.get("price"))
             v_compare = normalize_price(v.get("compare_at_price"))
@@ -271,6 +382,23 @@ class ShopifyAdapter(ProductAdapter):
                 in_stock_idx = i
                 break
 
+        # Currency fallback: product level, then a cached store-wide probe.
+        # Never guess a currency — an empty value is honest, a wrong one is not.
+        if not currency_code:
+            product_currency = str(raw.get("price_currency") or raw.get("currency") or "").strip()
+            if product_currency:
+                currency_code = product_currency
+                currency_source = "shopify_json.price_currency"
+        if not currency_code:
+            root_for_currency = root or (
+                f"{urlparse(source_url or product_url).scheme}://{urlparse(source_url or product_url).netloc}"
+                if (source_url or product_url) else ""
+            )
+            probed = self._get_store_currency(root_for_currency)
+            if probed:
+                currency_code = probed
+                currency_source = "storefront.Shopify.currency.active"
+
         primary_sku = skus[in_stock_idx] if in_stock_idx < len(skus) else (skus[0] if skus else "")
         active_price = prices[in_stock_idx] if in_stock_idx < len(prices) else (prices[0] if prices else "")
 
@@ -324,6 +452,7 @@ class ShopifyAdapter(ProductAdapter):
             "list_price": original_price,
             "compare_at_price": compare_at_val,
             "discount_percentage": discount_pct,
+            "currency": currency_code,
             "availability": availability,
             "stock_status": stock_status,
             "colors": colors_str,
@@ -340,7 +469,8 @@ class ShopifyAdapter(ProductAdapter):
             "price_source": price_src,
             "title_source": "shopify_json.title",
             "image_source": "shopify_json.images[0].src",
-            "sku_source": "shopify_json.variants[0].sku" if skus else "not_found",
+            "sku_source": f"shopify_json.variants[{in_stock_idx}].sku" if skus else "not_found",
+            "currency_source": currency_source,
             "description_source": "shopify_json.body_html",
             "availability_source": "shopify_json.variants[].available",
             "category_source": "shopify_json.product_type",

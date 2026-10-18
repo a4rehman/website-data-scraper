@@ -122,3 +122,110 @@ def test_generic_jsonld_parse():
     assert product["currency"] == "USD"
     assert product["brand"] == "SoundMax"
     assert product["main_image"] == "https://example.com/headphones.jpg"
+
+
+# ---------------------------------------------------------------------------
+# Regression: adapter selection must not depend on a successful HTML fetch.
+# A 429 on the preview fetch previously dropped Tehzeeb Libas into the generic
+# fallback, which emitted garbage titles such as "Rs.2,990".
+# ---------------------------------------------------------------------------
+
+def test_shopify_detected_from_url_without_html():
+    """A Shopify collection URL must resolve to ShopifyAdapter even with NO html."""
+    adapter = get_adapter("https://tehzeeblibas.com/collections/all")
+    assert isinstance(adapter, ShopifyAdapter)
+
+
+def test_shopify_detected_from_variant_query_without_html():
+    adapter = get_adapter("https://shop.example.com/products/abc?variant=123456")
+    assert isinstance(adapter, ShopifyAdapter)
+
+
+def test_non_shopify_urls_do_not_claim_shopify():
+    """URL-only heuristics must stay narrow enough not to steal other platforms."""
+    assert not isinstance(
+        get_adapter("https://unknown-shop-example.com/item/123"), ShopifyAdapter
+    )
+    assert not isinstance(
+        get_adapter("https://www.temu.com/pk-en/womens-clothing-o3-28.html"), ShopifyAdapter
+    )
+
+
+def test_generic_detection_never_fabricates_sku():
+    """Generic HTML extraction must leave sku empty rather than inventing one."""
+    adapter = GenericAdapter()
+    html = """
+    <html><head><meta property="og:title" content="Plain Product"/>
+    <meta property="product:price:amount" content="999"/></head>
+    <body><h1>Plain Product</h1></body></html>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    product = adapter._extract_single_html(soup, "https://shop.example.com/products/plain")
+    assert product["sku"] == ""
+    assert product["availability_source"] in ("html.stock", "not_found")
+
+
+# ---------------------------------------------------------------------------
+# Regression: /collections/all must use the COLLECTION-scoped JSON endpoint.
+# It used to be excluded by a `!= "all"` guard and fell through to the root
+# /products.json, which on Tehzeeb Libas serves cached prices ~1.2x higher
+# than the storefront (5100 reported vs 4250 displayed).
+# ---------------------------------------------------------------------------
+
+def test_shopify_collections_all_uses_collection_endpoint(monkeypatch):
+    import scraper.adapters.shopify as shopify_mod
+    calls = []
+
+    def fake_fetch_json(url, params=None, **kw):
+        calls.append(url)
+        if url.endswith("/collections/all/products.json"):
+            return {"products": [{"id": 1, "handle": "a", "title": "A",
+                                  "variants": [{"id": 1, "price": "4250.00",
+                                                "compare_at_price": "12550.00",
+                                                "available": True}]}]}
+        return {"products": []}
+
+    monkeypatch.setattr(shopify_mod, "fetch_json", fake_fetch_json)
+    adapter = ShopifyAdapter()
+    out = adapter.discover_products("https://tehzeeblibas.com/collections/all")
+
+    assert calls and calls[0] == "https://tehzeeblibas.com/collections/all/products.json", \
+        f"expected collection endpoint first, got {calls}"
+    assert len(out) == 1
+
+
+def test_shopify_collection_endpoint_falls_back_to_root(monkeypatch):
+    """If the collection endpoint is disabled, the root endpoint is still tried."""
+    import scraper.adapters.shopify as shopify_mod
+    calls = []
+
+    def fake_fetch_json(url, params=None, **kw):
+        calls.append(url)
+        if url == "https://example.com/products.json":
+            return {"products": [{"id": 9, "handle": "z", "title": "Z",
+                                  "variants": [{"id": 1, "price": "10.00",
+                                                "available": True}]}]}
+        return {"products": []}
+
+    monkeypatch.setattr(shopify_mod, "fetch_json", fake_fetch_json)
+    adapter = ShopifyAdapter()
+    out = adapter.discover_products("https://example.com/collections/summer")
+
+    assert "https://example.com/collections/summer/products.json" in calls
+    assert "https://example.com/products.json" in calls
+    assert len(out) == 1 and out[0]["handle"] == "z"
+
+
+def test_shopify_non_all_collection_still_uses_collection_endpoint(monkeypatch):
+    """Normal (non-'all') collections keep using the collection endpoint."""
+    import scraper.adapters.shopify as shopify_mod
+    calls = []
+
+    def fake_fetch_json(url, params=None, **kw):
+        calls.append(url)
+        return {"products": []}
+
+    monkeypatch.setattr(shopify_mod, "fetch_json", fake_fetch_json)
+    ShopifyAdapter().discover_products("https://example.com/collections/summer")
+
+    assert calls[0] == "https://example.com/collections/summer/products.json"
