@@ -96,13 +96,14 @@ def parse_product_data(raw_product: Dict[str, Any], collections_map: Optional[Di
 
     # Determine Pricing
     active_price = prices[0] if prices else None
-    original_price = compare_at_prices[0] if compare_at_prices else active_price
+    raw_compare = compare_at_prices[0] if compare_at_prices else None
     
-    if original_price and active_price and original_price > active_price:
+    if raw_compare and active_price and raw_compare > active_price:
+        original_price = raw_compare
         sale_price = active_price
         discount_percentage = calculate_discount_percentage(original_price, sale_price)
     else:
-        original_price = active_price
+        original_price = ""
         sale_price = ""
         discount_percentage = ""
 

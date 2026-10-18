@@ -264,17 +264,37 @@ class ShopifyAdapter(ProductAdapter):
                 f"Size: {v_size or v_title} | Color: {v_color} | Price: {v_price} | SKU: {v_sku} | Stock: {'In Stock' if v_avail else 'Out of Stock'}"
             )
 
-        primary_sku = skus[0] if skus else ""
-        active_price = prices[0] if prices else ""
-        original_price = compare_prices[0] if compare_prices else active_price
+        # Select active price & SKU, preferring the first in-stock variant
+        in_stock_idx = 0
+        for i, v in enumerate(raw_variants):
+            if v.get("available", True):
+                in_stock_idx = i
+                break
+
+        primary_sku = skus[in_stock_idx] if in_stock_idx < len(skus) else (skus[0] if skus else "")
+        active_price = prices[in_stock_idx] if in_stock_idx < len(prices) else (prices[0] if prices else "")
+
+        # Check compare_at_price: genuine original/strike-through price if higher than active_price
+        raw_compare = compare_prices[in_stock_idx] if in_stock_idx < len(compare_prices) else (compare_prices[0] if compare_prices else None)
         
-        if original_price and active_price and original_price > active_price:
+        if raw_compare and active_price and raw_compare > active_price:
+            original_price = raw_compare
             sale_price = active_price
             discount_pct = calculate_discount_percentage(original_price, sale_price)
+            compare_at_val = raw_compare
         else:
-            original_price = active_price
+            # Not on sale: missing compare-at values remain missing (NEVER fabricate original_price from active_price)
+            original_price = ""
             sale_price = ""
             discount_pct = ""
+            compare_at_val = ""
+
+        # Provenance: note variant index and whether variant prices vary
+        unique_prices = {p for p in prices if p is not None}
+        if len(unique_prices) > 1:
+            price_src = f"shopify_json.variants[{in_stock_idx}].price (varies: min={min(unique_prices)}, max={max(unique_prices)})"
+        else:
+            price_src = f"shopify_json.variants[{in_stock_idx}].price"
 
         sizes_str = "|".join(sorted(list(sizes_set)))
         colors_str = "|".join(sorted(list(colors_set)))
@@ -301,6 +321,8 @@ class ShopifyAdapter(ProductAdapter):
             "price": active_price,
             "sale_price": sale_price,
             "original_price": original_price,
+            "list_price": original_price,
+            "compare_at_price": compare_at_val,
             "discount_percentage": discount_pct,
             "availability": availability,
             "stock_status": stock_status,
@@ -315,7 +337,7 @@ class ShopifyAdapter(ProductAdapter):
             "additional_images": add_imgs,
             "all_images": all_imgs,
             # Provenance
-            "price_source": "shopify_json.variants[0].price",
+            "price_source": price_src,
             "title_source": "shopify_json.title",
             "image_source": "shopify_json.images[0].src",
             "sku_source": "shopify_json.variants[0].sku" if skus else "not_found",

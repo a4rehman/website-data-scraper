@@ -486,7 +486,8 @@ with tab_preview:
             
             preview_cols = [
                 c for c in [
-                    "product_name", "price", "sale_price", "original_price", "currency",
+                    "product_name", "price", "sale_price", "original_price", "compare_at_price",
+                    "discount_percentage", "price_source", "currency",
                     "brand", "category", "availability", "variant_count", "main_image", "product_url"
                 ] if c in df.columns
             ]

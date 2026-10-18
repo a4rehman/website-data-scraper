@@ -59,6 +59,7 @@ UNIVERSAL_CSV_COLUMNS = [
     "sale_price",
     "original_price",
     "list_price",
+    "compare_at_price",
     "discount_percentage",
     "currency",
     "availability",

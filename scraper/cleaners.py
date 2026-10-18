@@ -212,17 +212,25 @@ def normalize_universal_product(data: Dict[str, Any], source_url: str = "") -> D
     norm_sale = normalize_price(raw_sale)
     norm_orig = normalize_price(raw_orig)
 
-    # Determine active / sale / original relationship
-    if norm_orig and norm_price and norm_orig > norm_price:
-        if not norm_sale:
-            norm_sale = norm_price
+    # Determine active / sale / original relationship:
+    # A product has a genuine sale state ONLY if a valid compare-at/original price is strictly higher than selling price.
+    # Missing compare-at values remain missing instead of being fabricated.
+    if norm_orig is not None and norm_price is not None and norm_orig > norm_price:
+        active_selling_price = norm_price
+        actual_sale_price = norm_price
+        higher_orig_price = norm_orig
+        discount_pct = data.get("discount_percentage") or calculate_discount_percentage(norm_orig, norm_price)
+    elif norm_sale is not None and norm_orig is not None and norm_orig > norm_sale:
+        active_selling_price = norm_sale
+        actual_sale_price = norm_sale
+        higher_orig_price = norm_orig
         discount_pct = data.get("discount_percentage") or calculate_discount_percentage(norm_orig, norm_sale)
-    elif norm_sale and norm_orig and norm_orig > norm_sale:
-        discount_pct = data.get("discount_percentage") or calculate_discount_percentage(norm_orig, norm_sale)
-        if not norm_price:
-            norm_price = norm_sale
     else:
-        discount_pct = str(data.get("discount_percentage") or "")
+        # Not on sale or no valid higher compare-at price exists
+        active_selling_price = norm_price if norm_price is not None else (norm_sale if norm_sale is not None else None)
+        actual_sale_price = ""
+        higher_orig_price = ""
+        discount_pct = ""
 
     # Images
     main_img = data.get("main_image") or data.get("image_url") or ""
@@ -305,10 +313,11 @@ def normalize_universal_product(data: Dict[str, Any], source_url: str = "") -> D
         "product_type": str(data.get("product_type") or ""),
         "tags": str(data.get("tags") or ""),
         "product_url": str(product_url),
-        "price": norm_price if norm_price is not None else "",
-        "sale_price": norm_sale if norm_sale is not None else "",
-        "original_price": norm_orig if norm_orig is not None else "",
-        "list_price": norm_orig if norm_orig is not None else "",
+        "price": active_selling_price if active_selling_price is not None else "",
+        "sale_price": actual_sale_price if actual_sale_price else "",
+        "original_price": higher_orig_price if higher_orig_price else "",
+        "list_price": higher_orig_price if higher_orig_price else "",
+        "compare_at_price": higher_orig_price if higher_orig_price else "",
         "discount_percentage": discount_pct,
         "currency": curr,
         "availability": avail,
